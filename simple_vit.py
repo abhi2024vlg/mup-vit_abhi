@@ -1,24 +1,24 @@
 import math
-
 from collections import OrderedDict
 from functools import partial
 from typing import Callable, Optional
 import torch
 import torch.nn as nn
 from torchvision.models.vision_transformer import MLPBlock
+import torch.nn.functional as F
+from typing import List
 
+# # Taken from https://github.com/lucidrains/vit-pytorch, likely ported from https://github.com/google-research/big_vision/
+# def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
+#     y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+#     assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
+#     omega = torch.arange(dim // 4) / (dim // 4 - 1)
+#     omega = 1.0 / (temperature ** omega)
 
-# Taken from https://github.com/lucidrains/vit-pytorch, likely ported from https://github.com/google-research/big_vision/
-def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
-    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
-    assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
-    omega = torch.arange(dim // 4) / (dim // 4 - 1)
-    omega = 1.0 / (temperature ** omega)
-
-    y = y.flatten()[:, None] * omega[None, :]
-    x = x.flatten()[:, None] * omega[None, :]
-    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
-    return pe.type(dtype)
+#     y = y.flatten()[:, None] * omega[None, :]
+#     x = x.flatten()[:, None] * omega[None, :]
+#     pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
+#     return pe.type(dtype)
 
 
 class EncoderBlock(nn.Module):
@@ -49,7 +49,7 @@ class EncoderBlock(nn.Module):
         bound = math.sqrt(3 / hidden_dim)
         nn.init.uniform_(self.self_attention.in_proj_weight, -bound, bound)
         nn.init.uniform_(self.self_attention.out_proj.weight, -bound, bound)
-
+    
     def forward(self, input: torch.Tensor):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.ln_1(input)
@@ -60,7 +60,6 @@ class EncoderBlock(nn.Module):
         y = self.ln_2(x)
         y = self.mlp(y)
         return x + y
-
 
 class Encoder(nn.Module):
     """Transformer Model Encoder for sequence to sequence translation."""
@@ -95,6 +94,67 @@ class Encoder(nn.Module):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         return self.ln(self.layers(self.dropout(input)))
 
+class DilatedConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dilation):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.activation = nn.ReLU()
+
+    def forward(self, x):
+        return self.activation(self.bn(self.conv(x)))
+
+class TokenGenerator(nn.Module):
+    def __init__(self, image_size=256, patch_size=16, in_channels=3, embed_dim=256):
+        super().__init__()
+        
+        self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        self.stage1 = DilatedConvBlock(embed_dim, embed_dim, dilation=1)
+        self.stage2 = DilatedConvBlock(embed_dim, embed_dim, dilation=4)
+        
+        self._init_weights()
+        
+    def _init_weights(self):
+        # Initialize patch_embed (equivalent to conv_proj in the original code)
+        fan_in = self.patch_embed.in_channels * self.patch_embed.kernel_size[0] * self.patch_embed.kernel_size[1]
+        std = math.sqrt(1 / fan_in) / .87962566103423978
+        nn.init.trunc_normal_(self.patch_embed.weight, std=std, a=-2 * std, b=2 * std)
+        if self.patch_embed.bias is not None:
+            nn.init.zeros_(self.patch_embed.bias)
+        
+        # Initialize dilated convolutions (similar to conv_last in the original code)
+        for m in [self.stage1.conv, self.stage2.conv]:
+            nn.init.normal_(m.weight, mean=0.0, std=math.sqrt(2.0 / m.out_channels))
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        
+        # Initialize batch norm layers
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        # Initial patching: 16x16 patches of 16x16 resolution
+        print(x.shape)
+        x = self.patch_embed(x)  # Shape: [B, embed_dim, 16, 16]
+        tokens_stage1 = x.flatten(2).transpose(1, 2)  # Shape: [B, 256, embed_dim]
+        print(tokens_stage1.shape)
+        # Stage 1: 4x4 patches with 64x64 receptive field
+        x = self.stage1(x)
+        x = F.avg_pool2d(x, kernel_size=4)  # Shape: [B, embed_dim, 4, 4]
+        tokens_stage2 = x.flatten(2).transpose(1, 2)  # Shape: [B, 16, embed_dim]
+        print(tokens_stage2.shape)
+        # Stage 2: 1x1 patch with global receptive field
+        x = self.stage2(x)
+        x = F.adaptive_avg_pool2d(x, 1)  # Shape: [B, embed_dim, 1, 1]
+        tokens_stage3 = x.flatten(2).transpose(1, 2)  # Shape: [B, 1, embed_dim]
+        print(tokens_stage3.shape)
+        # Combine tokens from all stages
+        tokens = torch.cat([tokens_stage1, tokens_stage2, tokens_stage3], dim=1)  # Shape: [B, 273, embed_dim]
+        
+        return tokens
 
 class SimpleVisionTransformer(nn.Module):
     """Vision Transformer modified per https://arxiv.org/abs/2205.01580."""
@@ -110,10 +170,12 @@ class SimpleVisionTransformer(nn.Module):
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
         num_classes: int = 1000,
+        seq_length: int = 273,  # 256 + 16 + 1
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
     ):
         super().__init__()
+        
         torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
         self.image_size = image_size
         self.patch_size = patch_size
@@ -125,14 +187,12 @@ class SimpleVisionTransformer(nn.Module):
         self.representation_size = representation_size
         self.norm_layer = norm_layer
 
-        self.conv_proj = nn.Conv2d(
-            in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
-        )
-
-        h = w = image_size // patch_size
-        seq_length = h * w
-        self.register_buffer("pos_embedding", posemb_sincos_2d(h=h, w=w, dim=hidden_dim))
-
+        # Add TokenGenerator
+        self.token_generator = TokenGenerator(image_size=image_size, patch_size=patch_size, in_channels=3, embed_dim=hidden_dim)
+    
+        # Update seq_length to match the number of tokens from TokenGenerator
+        self.seq_length = seq_length
+        
         self.encoder = Encoder(
             seq_length,
             num_layers,
@@ -143,7 +203,6 @@ class SimpleVisionTransformer(nn.Module):
             attention_dropout,
             norm_layer,
         )
-        self.seq_length = seq_length
 
         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
         if representation_size is None:
@@ -154,23 +213,8 @@ class SimpleVisionTransformer(nn.Module):
             heads_layers["head"] = nn.Linear(representation_size, num_classes)
 
         self.heads = nn.Sequential(heads_layers)
-
-        if isinstance(self.conv_proj, nn.Conv2d):
-            # Init the patchify stem
-            fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1]
-            # constant is stddev of standard normal truncated to (-2, 2)
-            std = math.sqrt(1 / fan_in) / .87962566103423978
-            nn.init.trunc_normal_(self.conv_proj.weight, std=std, a=-2 * std, b=2 * std)
-            if self.conv_proj.bias is not None:
-                nn.init.zeros_(self.conv_proj.bias)
-        elif self.conv_proj.conv_last is not None and isinstance(self.conv_proj.conv_last, nn.Conv2d):
-            # Init the last 1x1 conv of the conv stem
-            nn.init.normal_(
-                self.conv_proj.conv_last.weight, mean=0.0, std=math.sqrt(2.0 / self.conv_proj.conv_last.out_channels)
-            )
-            if self.conv_proj.conv_last.bias is not None:
-                nn.init.zeros_(self.conv_proj.conv_last.bias)
-
+        
+        # Initialize weights for the heads
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
             fan_in = self.heads.pre_logits.in_features
             nn.init.trunc_normal_(self.heads.pre_logits.weight, std=math.sqrt(1 / fan_in))
@@ -180,33 +224,14 @@ class SimpleVisionTransformer(nn.Module):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
 
-    def _process_input(self, x: torch.Tensor) -> torch.Tensor:
-        n, c, h, w = x.shape
-        p = self.patch_size
-        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
-        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
-        n_h = h // p
-        n_w = w // p
-
-        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
-        x = self.conv_proj(x)
-        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
-        x = x.reshape(n, self.hidden_dim, n_h * n_w)
-
-        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
-        # The self attention layer expects inputs in the format (N, S, E)
-        # where S is the source sequence length, N is the batch size, E is the
-        # embedding dimension
-        x = x.permute(0, 2, 1)
-
-        return x
-
     def forward(self, x: torch.Tensor):
-        # Reshape and permute the input tensor
-        x = self._process_input(x)
-        x = x + self.pos_embedding
+        # Use TokenGenerator to get tokens
+        x = self.token_generator(x)  # Shape: [B, 273, hidden_dim]
+        
+        # No need for position embeddings as they're implicitly handled by TokenGenerator
+        
         x = self.encoder(x)
-        x = x.mean(dim = 1)
+        x = x.mean(dim=1)
         x = self.heads(x)
-
+        
         return x
