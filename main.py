@@ -29,7 +29,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 from torchvision.transforms import v2
 from torch.utils.data import Subset
-
+import torchvision.transforms as transforms
 from simple_vit import SimpleVisionTransformer
 from rand_augment import RandAugment17
 
@@ -258,72 +258,11 @@ def main_worker(gpu, args):
         lr=args.lr,
     )
 
-    # Data loading code
-    if args.dummy:
-        print("=> Dummy data is used!")
-        train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000,
-            v2.ToDtype(torch.float32, scale=True))
-        val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000,
-            v2.ToDtype(torch.float32, scale=True))
-    else:
-        value_range = v2.Normalize(
-            mean=[0.5] * 3,
-            std=[0.5] * 3)
-
-        cutout_const = 40
-        translate_const = 100
-        MAX_LEVEL = 10
-
-        translate_magnitude = lambda num_bins, _h, _w: torch.linspace(0.0, translate_const, num_bins)
-        shear_magnitude = lambda num_bins, _h, _w: torch.linspace(0.0, 0.3, num_bins)
-        enhance_magnitude = lambda num_bins, _h, _w: torch.linspace(0, 0.9, num_bins)  # It was -0.9, 0.9 but negative magnitude results in the opposite effect.
-
-        RandAugment17._AUGMENTATION_SPACE = {
-            "TranslateX": (translate_magnitude, True),
-            "TranslateY": (translate_magnitude, True),
-            "ShearX": (shear_magnitude, True),
-            "ShearY": (shear_magnitude, True),
-            "Rotate": (lambda num_bins, height, width: torch.linspace(0.0, 30.0, num_bins), True),
-            "Brightness": (enhance_magnitude, False),
-            "Color": (enhance_magnitude, False),
-            "Contrast": (enhance_magnitude, False),
-            "Sharpness": (enhance_magnitude, False),
-            "Posterize": (  # Unchanged
-                lambda num_bins, height, width: (8 - (torch.arange(num_bins) / ((num_bins - 1) / 4))).round().int(),
-                False,
-            ),
-            "Solarize": (lambda num_bins, height, width: torch.linspace(1.0, 0.0, num_bins), False),  # Unchanged
-            "AutoContrast": (lambda num_bins, height, width: None, False),  # Unchanged
-            "Equalize": (lambda num_bins, height, width: None, False),  # Unchanged
-            "Invert": (lambda num_bins, height, width: None, False),  # "New" (equivalent to MAX_LEVEL Solarize)
-            "SolarizeAdd": (lambda num_bins, height, width: torch.linspace(0., 110., num_bins), False),  # New
-            "Cutout": (lambda num_bins, height, width: torch.linspace(0., float(cutout_const), num_bins), False),  # New
-        }
-        randaug = RandAugment17(2, 10, num_magnitude_bins=MAX_LEVEL + 1, fill=[128] * 3)
-
-        train_dataset = datasets.ImageNet(
-            args.data,
-            split='train',
-            transform=v2.Compose([
-                v2.ToImage(),
-                v2.RandomResizedCrop(224, scale=(0.05, 1.0)),
-                v2.RandomHorizontalFlip(),
-                randaug,
-                v2.ToDtype(torch.float32, scale=True),
-                value_range,
-            ]))
-
-        val_dataset = datasets.ImageNet(
-            args.data,
-            split='val',
-            transform=v2.Compose([
-                v2.ToImage(),
-                v2.Resize(256),
-                v2.CenterCrop(224),
-                v2.ToDtype(torch.float32, scale=True),
-                value_range,
-            ]))
-
+    # Data loading code Using Dummy data
+    print("=> Dummy data is used!")
+    train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transform=transforms.ToTensor())
+    val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transform=transforms.ToTensor())
+        
     n = len(train_dataset)
     total_steps = round(n * args.epochs / args.batch_size)
 
