@@ -20,6 +20,207 @@ from typing import List
 #     pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
 #     return pe.type(dtype)
 
+##NEW CODE
+
+class PatchExtractor(nn.Module):
+    def __init__(self,image_size = 32,patch_size = 16,in_channels=3,embed_dim=384):
+        super(PatchExtractor, self).__init__()
+        
+        self.projection = nn.Conv2d(in_channels=3, out_channels=embed_dim, kernel_size=16, stride=1, padding=0, bias=False)
+        self.embed_dim = embed_dim
+        
+    def forward(self, x):
+        # x shape: (batch_size, 3, 32, 32)
+        
+        # Extract 4 patches of 3x16x16
+        patches = x.unfold(2, 16, 16).unfold(3, 16, 16)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+        patches = patches.view(x.size(0), 4, 3, 16, 16)
+
+        # Downsample the original image to 3x16x16 using average pooling
+        downsampled = F.avg_pool2d(x, kernel_size=2, stride=2)
+
+        # Combine the 4 patches and the downsampled image
+        combined = torch.cat([patches, downsampled.unsqueeze(1)], dim=1)
+        #print(combined.shape)
+        # Reshape to (batch_size, 5, 3,16,16)
+        output = combined.view(x.size(0), 5, 3, 16, 16)
+        #print(output.shape)
+        # x shape: (batch_size, 5, 3, 16, 16)
+        batch_size, num_patches, channels, height, width = output.size()
+        
+        # Reshape to (batch_size * num_patches, channels, height, width)
+        output = output.view(batch_size * num_patches, channels, height, width)
+        #print(output.shape)
+        # Apply convolutional layer
+        output = self.projection(output)
+        #print(output.shape)
+        # Reshape back to (batch_size, num_patches,embed_dim, 1, 1)
+        output = output.view(batch_size, num_patches,self.embed_dim, 1, 1)
+        #print(output.shape)
+        # Squeeze to get (batch_size, num_patches,embed_dim)
+        output = output.squeeze(-1).squeeze(-1)
+        #print(output.shape)
+        return output
+
+class EncoderBlock(nn.Module):
+    """Transformer encoder block."""
+
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float,
+        attention_dropout: float,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+
+        # Attention block
+        self.ln_1 = norm_layer(hidden_dim)
+        self.self_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=attention_dropout, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+
+        # MLP block
+        self.ln_2 = norm_layer(hidden_dim)
+        self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
+
+        # Fix init discrepancy between nn.MultiheadAttention and that of big_vision
+        bound = math.sqrt(3 / hidden_dim)
+        nn.init.uniform_(self.self_attention.in_proj_weight, -bound, bound)
+        nn.init.uniform_(self.self_attention.out_proj.weight, -bound, bound)
+
+    def forward(self, input: torch.Tensor):
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        x = self.ln_1(input)
+        x, _ = self.self_attention(x, x, x, need_weights=False)
+        x = self.dropout(x)
+        x = x + input
+
+        y = self.ln_2(x)
+        y = self.mlp(y)
+        return x + y
+
+
+class Encoder(nn.Module):
+    """Transformer Model Encoder for sequence to sequence translation."""
+
+    def __init__(
+        self,
+        seq_length: int,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float,
+        attention_dropout: float,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        layers: OrderedDict[str, nn.Module] = OrderedDict()
+        for i in range(num_layers):
+            layers[f"encoder_layer_{i}"] = EncoderBlock(
+                num_heads,
+                hidden_dim,
+                mlp_dim,
+                dropout,
+                attention_dropout,
+                norm_layer,
+            )
+        self.layers = nn.Sequential(layers)
+        self.ln = norm_layer(hidden_dim)
+
+    def forward(self, input: torch.Tensor):
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        return self.ln(self.layers(self.dropout(input)))
+
+
+class SimpleVisionTransformer(nn.Module):
+    """Vision Transformer modified per https://arxiv.org/abs/2205.01580."""
+
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        num_classes: int = 10,
+        seq_length: int = 5,  # 4 + 1
+        representation_size: Optional[int] = None,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
+        self.mlp_dim = mlp_dim
+        self.attention_dropout = attention_dropout
+        self.dropout = dropout
+        self.num_classes = num_classes
+        self.representation_size = representation_size
+        self.norm_layer = norm_layer
+
+        # Add PatchExtractor
+        self.patch_extractor = PatchExtractor(image_size=image_size, patch_size=patch_size, in_channels=3, embed_dim=hidden_dim)
+        
+        # Update seq_length to match the number of tokens from TokenGenerator
+        self.seq_length = seq_length
+        
+        self.encoder = Encoder(
+            seq_length,
+            num_layers,
+            num_heads,
+            hidden_dim,
+            mlp_dim,
+            dropout,
+            attention_dropout,
+            norm_layer,
+        )
+        self.seq_length = seq_length
+
+        heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
+        if representation_size is None:
+            heads_layers["head"] = nn.Linear(hidden_dim, num_classes)
+        else:
+            heads_layers["pre_logits"] = nn.Linear(hidden_dim, representation_size)
+            heads_layers["act"] = nn.Tanh()
+            heads_layers["head"] = nn.Linear(representation_size, num_classes)
+
+        self.heads = nn.Sequential(heads_layers)
+        
+        # Initialize weights for the heads
+        if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
+            fan_in = self.heads.pre_logits.in_features
+            nn.init.trunc_normal_(self.heads.pre_logits.weight, std=math.sqrt(1 / fan_in))
+            nn.init.zeros_(self.heads.pre_logits.bias)
+
+        if isinstance(self.heads.head, nn.Linear):
+            nn.init.zeros_(self.heads.head.weight)
+            nn.init.zeros_(self.heads.head.bias)
+
+
+    def forward(self, x: torch.Tensor):
+        # Use TokenGenerator to get tokens
+        #print(x.shape)
+        x = self.patch_extractor(x)  # Shape: [B,5, hidden_dim]
+        #print(x.shape)
+        x = self.encoder(x)
+        #print(x.shape)
+        x = x.mean(dim = 1)
+        #print(x.shape)
+        x = self.heads(x)
+        #print(x.shape)
+        return x
+
+## OLD CODE
 
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
@@ -235,3 +436,5 @@ class SimpleVisionTransformer(nn.Module):
         x = self.heads(x)
         
         return x
+
+
