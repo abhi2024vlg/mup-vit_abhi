@@ -1,521 +1,330 @@
-# Modified from https://github.com/pytorch/examples/blob/main/imagenet/main.py
-
-import argparse
+### Necessary Imports and dependencies
+### Wandb project_name is ImageNet_Avg_Conv2D
 import os
-import math
-import random
 import shutil
 import time
-import warnings
-from datetime import datetime
+import math
 from enum import Enum
-
+from functools import partial
+from collections import OrderedDict
 import torch
-import torch.backends.cudnn as cudnn
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
-import torch.nn.parallel
-import torch.optim
+import torch.nn.functional as F
+import torch.optim as optim
 import torch.utils.data
-import torch.utils.data.distributed
-
-try:
-    import horovod.torch as hvd
-except ImportError:
-    hvd = None
-
 import torchvision.datasets as datasets
-import torchvision.models as models
 from torchvision.transforms import v2
-from torch.utils.data import Subset
 import torchvision.transforms as transforms
-from simple_vit import SimpleVisionTransformer
-from rand_augment import RandAugment17
-
+from typing import Any, Dict, Union, Type, Callable, Optional, List
+from torchvision.models.vision_transformer import MLPBlock
 import wandb
 
-# "(...)/python3.10/site-packages/torch/_inductor/compile_fx.py:140: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance."
-torch.set_float32_matmul_precision('high')
+num_epochs=90
 
-parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
-                    help='path to dataset (default: imagenet)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
-                    help='number of total epochs to run')
-parser.add_argument('--log-steps', default=2500, type=int, metavar='N',
-                    help='eval and log every N steps')
-parser.add_argument('--start-step', default=0, type=int, metavar='N',
-                    help='manual step number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
-                    metavar='N',
-                    help='mini-batch size (default: 256), this is the total '
-                         'batch size of all GPUs on the current node when '
-                         'using Data Parallel or Distributed Data Parallel')
-parser.add_argument("--accum-freq", default=1, type=int,
-                    help="Update the model every --acum-freq steps.")
-parser.add_argument("--warmup", default=10000, type=int,
-                    help="Number of steps to warmup for.")
-parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float,
-                    metavar='LR', help='maximum learning rate', dest='lr')
-parser.add_argument('--wd', '--weight-decay', default=0.1, type=float,
-                    metavar='W', help='weight decay (default: 0.1)',
-                    dest='weight_decay')
-parser.add_argument('-p', '--print-freq', default=100, type=int,
-                    metavar='N', help='print frequency (default: 100)')
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
-parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
-                    help='evaluate model on validation set')
-parser.add_argument('--world-size', default=-1, type=int,
-                    help='number of nodes for distributed training')
-parser.add_argument('--rank', default=-1, type=int,
-                    help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
-                    help='url used to set up distributed training')
-parser.add_argument('--dist-backend', default='nccl', type=str,
-                    help='distributed backend')
-parser.add_argument('--seed', default=None, type=int,
-                    help='seed for initializing training. ')
-parser.add_argument('--gpu', default=None, type=int,
-                    help='GPU id to use.')
-parser.add_argument('--multiprocessing-distributed', action='store_true',
-                    help='Use multi-processing distributed training to launch '
-                         'N processes per node, which has N GPUs. This is the '
-                         'fastest way to use PyTorch for either single node or '
-                         'multi node data parallel training')
-parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
-parser.add_argument("--logs", default="./logs/", type=str,
-                    help="Where to store logs. Use None to avoid storing logs.")
-parser.add_argument('--name', default=None, type=str,
-                    help='Optional identifier for the experiment when storing logs. '
-                         'Otherwise use current time.')
-parser.add_argument("--report-to", default='', type=str,
-                    help="Options are ['wandb']")
-parser.add_argument("--wandb-notes", default='', type=str,
-                    help="Notes if logging with wandb")
-best_acc1 = 0
+# Parameters specific to CIFAR-10
+batch_size = 128
+num_workers = 4 
+
+# Dataset loading code
+# Define CIFAR-10 datasets with image size 256x256
+# Needs to be replaced by ImagNet image size256,256
+
+train_dataset = datasets.CIFAR10(
+    root='./data',
+    train=True,
+    download=True,
+    transform=transforms.Compose([
+        transforms.RandomResizedCrop(256, scale=(0.05, 1.0)),  # Change to 256x256
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+)
+
+val_dataset = datasets.CIFAR10(
+    root='./data',
+    train=False,
+    download=True,
+    transform=transforms.Compose([
+        transforms.Resize(256),  # Resize to 256
+        transforms.CenterCrop(256),  # Center crop to 256x256
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+)
+
+n = len(train_dataset)
+
+total_steps = round((n * num_epochs) / batch_size)
+
+start_step=0
+
+mixup = v2.MixUp(alpha=0.2, num_classes=10)
+
+train_loader = torch.utils.data.DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=num_workers,
+    pin_memory=True,
+    collate_fn=lambda batch: mixup(*torch.utils.data.default_collate(batch)), 
+    drop_last=True
+)
+
+val_loader = torch.utils.data.DataLoader(
+    val_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=num_workers,
+    pin_memory=True
+)
+
+warmup_try=10000
+
+class PatchExtractor(nn.Module):
+    def __init__(self, image_size=256, patch_size=16, in_channels=3, embed_dim=384):
+        super(PatchExtractor, self).__init__()
+        
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_patches_original = (image_size // patch_size) ** 2
+        self.num_patches_downsampled_64 = ((image_size // 4) // patch_size) ** 2
+        self.num_patches_downsampled_16 = 1  # 16x16 image gives 1 patch of 16x16
+        
+        self.projection= nn.Conv2d(in_channels=in_channels, out_channels=embed_dim,kernel_size=patch_size, stride=patch_size, padding=0, bias=False)
+        
+        self.downsample = nn.AvgPool2d(kernel_size=4, stride=4, padding=0)
+        
+        self.embed_dim = embed_dim
+        
+    def forward(self, x):
+        # x shape: (batch_size, in_channels, 256, 256)
+        
+        # Process original image
+        x_original = self.projection(x)
+        x_original = x_original.flatten(2).transpose(1, 2)
+        # x_original shape: (batch_size, 256, embed_dim)
+        
+        # Downsample to 64x64
+        x_64 = self.downsample(x)
+        # x_64 shape: (batch_size, in_channels, 64, 64)
+        
+        # Process 64x64 image
+        x_64_patches = self.projection(x_64)
+        x_64_patches = x_64_patches.flatten(2).transpose(1, 2)
+        # x_64_patches shape: (batch_size, 16, embed_dim)
+        
+        # Downsample to 16x16
+        x_16 = self.downsample(x_64)
+        # x_16 shape: (batch_size, in_channels, 16, 16)
+        
+        # Process 16x16 image
+        x_16_patch = self.projection(x_16)
+        x_16_patch = x_16_patch.flatten(2).transpose(1, 2)
+        # x_16_patches shape: (batch_size, 1, embed_dim)
+        
+        # Concatenate all
+        x_combined = torch.cat([x_original, x_64_patches, x_16_patch], dim=1)
+        # x_combined shape: (batch_size, 273, embed_dim)
+        
+        return x_combined
+
+class EncoderBlock(nn.Module):
+    """Transformer encoder block."""
+
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float,
+        attention_dropout: float,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+
+        # Attention block
+        self.ln_1 = norm_layer(hidden_dim)
+        self.self_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=attention_dropout, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+
+        # MLP block
+        self.ln_2 = norm_layer(hidden_dim)
+        self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
+
+        # Fix init discrepancy between nn.MultiheadAttention and that of big_vision
+        bound = math.sqrt(3 / hidden_dim)
+        nn.init.uniform_(self.self_attention.in_proj_weight, -bound, bound)
+        nn.init.uniform_(self.self_attention.out_proj.weight, -bound, bound)
+
+    def forward(self, input: torch.Tensor):
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        x = self.ln_1(input)
+        x, _ = self.self_attention(x, x, x, need_weights=False)
+        x = self.dropout(x)
+        x = x + input
+
+        y = self.ln_2(x)
+        y = self.mlp(y)
+        return x + y
 
 
-def broadcast_object(args, obj, src=0):
-    # broadcast a pickle-able python object from rank-0 to all ranks
-    if args.horovod:
-        return hvd.broadcast_object(obj, root_rank=src)
-    else:
-        if args.rank == src:
-            objects = [obj]
+class Encoder(nn.Module):
+    """Transformer Model Encoder for sequence to sequence translation."""
+
+    def __init__(
+        self,
+        seq_length: int,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float,
+        attention_dropout: float,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        layers: OrderedDict[str, nn.Module] = OrderedDict()
+        for i in range(num_layers):
+            layers[f"encoder_layer_{i}"] = EncoderBlock(
+                num_heads,
+                hidden_dim,
+                mlp_dim,
+                dropout,
+                attention_dropout,
+                norm_layer,
+            )
+        self.layers = nn.Sequential(layers)
+        self.ln = norm_layer(hidden_dim)
+
+    def forward(self, input: torch.Tensor):
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        return self.ln(self.layers(self.dropout(input)))
+
+
+class SimpleVisionTransformer(nn.Module):
+    """Vision Transformer modified per https://arxiv.org/abs/2205.01580."""
+
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        num_classes: int = 10, # No. of classes have to be changed to 1000 for imagenet
+        seq_length: int = 273,  # 256 + 16 + 1
+        representation_size: Optional[int] = None,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
+        self.mlp_dim = mlp_dim
+        self.attention_dropout = attention_dropout
+        self.dropout = dropout
+        self.num_classes = num_classes
+        self.representation_size = representation_size
+        self.norm_layer = norm_layer
+
+        # Add PatchExtractor
+        self.patch_extractor = PatchExtractor(image_size=image_size, patch_size=patch_size, in_channels=3, embed_dim=hidden_dim)
+        
+        # Update seq_length to match the number of tokens from TokenGenerator
+        self.seq_length = seq_length
+        
+        self.encoder = Encoder(
+            seq_length,
+            num_layers,
+            num_heads,
+            hidden_dim,
+            mlp_dim,
+            dropout,
+            attention_dropout,
+            norm_layer,
+        )
+        self.seq_length = seq_length
+
+        heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
+        if representation_size is None:
+            heads_layers["head"] = nn.Linear(hidden_dim, num_classes)
         else:
-            objects = [None]
-        dist.broadcast_object_list(objects, src=src)
-        return objects[0]
+            heads_layers["pre_logits"] = nn.Linear(hidden_dim, representation_size)
+            heads_layers["act"] = nn.Tanh()
+            heads_layers["head"] = nn.Linear(representation_size, num_classes)
+
+        self.heads = nn.Sequential(heads_layers)
+        
+        # Initialize weights for the heads
+        if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
+            fan_in = self.heads.pre_logits.in_features
+            nn.init.trunc_normal_(self.heads.pre_logits.weight, std=math.sqrt(1 / fan_in))
+            nn.init.zeros_(self.heads.pre_logits.bias)
+
+        if isinstance(self.heads.head, nn.Linear):
+            nn.init.zeros_(self.heads.head.weight)
+            nn.init.zeros_(self.heads.head.bias)
 
 
-def main():
-    args = parser.parse_args()
-
-    if args.seed is not None:
-        random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        cudnn.deterministic = True
-        cudnn.benchmark = False
-        warnings.warn('You have chosen to seed training. '
-                      'This will turn on the CUDNN deterministic setting, '
-                      'which can slow down your training considerably! '
-                      'You may see unexpected behavior when restarting '
-                      'from checkpoints.')
-
-    if args.gpu is not None:
-        warnings.warn('You have chosen a specific GPU. This will completely '
-                      'disable data parallelism.')
-
-    if args.dist_url == "env://" and args.world_size == -1:
-        args.world_size = int(os.environ["WORLD_SIZE"])
-
-    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
-
-    if torch.cuda.is_available():
-        args.ngpus_per_node = torch.cuda.device_count()
-        if args.ngpus_per_node == 1 and args.dist_backend == "nccl":
-            warnings.warn("nccl backend >=2.5 requires GPU count>1, see https://github.com/NVIDIA/nccl/issues/103 perhaps use 'gloo'")
-    else:
-        args.ngpus_per_node = 1
-
-    # get the name of the experiments
-    if args.name is None:
-        date_str = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
-        if args.distributed:
-            # sync date_str from master to all ranks
-            date_str = broadcast_object(args, date_str)
-        args.name = '-'.join([
-            date_str,
-            f"lr_{args.lr}",
-            f"b_{args.batch_size}",
-        ])
-
-    log_base_path = os.path.join(args.logs, args.name)
-    args.checkpoint_path = os.path.join(log_base_path, "checkpoints")
-    os.makedirs(args.checkpoint_path, exist_ok=True)
-    args.wandb = 'wandb' in args.report_to
-
-    if args.multiprocessing_distributed:
-        # Since we have ngpus_per_node processes per node, the total world_size
-        # needs to be adjusted accordingly
-        args.world_size = args.ngpus_per_node * args.world_size
-        # Use torch.multiprocessing.spawn to launch distributed processes: the
-        # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(args, ))
-    else:
-        # Simply call main_worker function
-        main_worker(args.gpu, args)
-
-
-def is_master(args):
-    return not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % arg.ngpus_per_node == 0)
-
-
+    def forward(self, x: torch.Tensor):
+        # Use TokenGenerator to get tokens
+        #print(x.shape)
+        x = self.patch_extractor(x)  # Shape: [B,5, hidden_dim]
+        #print(x.shape)
+        x = self.encoder(x)
+        #print(x.shape)
+        x = x.mean(dim = 1)
+        #print(x.shape)
+        x = self.heads(x)
+        #print(x.shape)
+        return x
+    
 def weight_decay_param(n, p):
     return p.ndim >= 2 and n.endswith('weight')
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def main_worker(gpu, args):
-    global best_acc1
-    args.gpu = gpu
+# create model
+model = SimpleVisionTransformer(
+    image_size=256,
+    patch_size=16,
+    num_layers=12,
+    num_heads=6,
+    hidden_dim=384,
+    mlp_dim=1536,
+).to(device)
+wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
+non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
 
-    if args.gpu is not None:
-        print("Use GPU: {} for training".format(args.gpu))
+original_model = model
 
-    if args.distributed:
-        if args.dist_url == "env://" and args.rank == -1:
-            args.rank = int(os.environ["RANK"])
-        if args.multiprocessing_distributed:
-            # For multiprocessing distributed training, rank needs to be the
-            # global rank among all the processes
-            args.rank = args.rank * args.ngpus_per_node + gpu
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank)
-    # create model
-    model = SimpleVisionTransformer(
-        image_size=224,
-        patch_size=16,
-        num_layers=12,
-        num_heads=6,
-        hidden_dim=384,
-        mlp_dim=1536,
-    )
+weight_decay = 0.1
+learning_rate = 1e-3
 
-    wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
-    non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
+criterion = nn.CrossEntropyLoss().to(device)
+optimizer = torch.optim.AdamW(
+    [
+        {"params": wd_params, "weight_decay": 0.1},
+        {"params": non_wd_params, "weight_decay": 0.},
+    ],
+    lr=learning_rate,
+)
 
-    if not torch.cuda.is_available() and not torch.backends.mps.is_available():
-        print('using CPU, this will be slow')
-    elif args.distributed:
-        # For multiprocessing distributed, DistributedDataParallel constructor
-        # should always set the single device scope, otherwise,
-        # DistributedDataParallel will use all available devices.
-        if torch.cuda.is_available():
-            if args.gpu is not None:
-                torch.cuda.set_device(args.gpu)
-                model.cuda(args.gpu)
-                # When using a single GPU per process and per
-                # DistributedDataParallel, we need to divide the batch size
-                # ourselves based on the total number of GPUs of the current node.
-                args.batch_size = int(args.batch_size / args.ngpus_per_node)
-                args.workers = int((args.workers + args.ngpus_per_node - 1) / args.ngpus_per_node)
-                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-            else:
-                model.cuda()
-                # DistributedDataParallel will divide and allocate batch_size to all
-                # available GPUs if device_ids are not set
-                model = torch.nn.parallel.DistributedDataParallel(model)
-    elif args.gpu is not None and torch.cuda.is_available():
-        torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        model = model.to(device)
-    else:
-        # DataParallel will divide and allocate batch_size to all available GPUs
-        model = torch.nn.DataParallel(model).cuda()
+warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step / warmup_try)
+cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_try)
+scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [warmup_try])
 
-    if torch.cuda.is_available():
-        if args.gpu:
-            device = torch.device('cuda:{}'.format(args.gpu))
-        else:
-            device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    
-    criterion = nn.CrossEntropyLoss().to(device)
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": wd_params, "weight_decay": args.weight_decay},
-            {"params": non_wd_params, "weight_decay": 0.},
-        ],
-        lr=args.lr,
-    )
+#Change_path_for_the_directory;This is the directory where model weights are to be saved
+checkpoint_path = "/kaggle/working/"
 
-    # Data loading code Using Dummy data
-    print("=> Dummy data is used!")
-    train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transform=transforms.ToTensor())
-    val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transform=transforms.ToTensor())
-        
-    n = len(train_dataset)
-    total_steps = round(n * args.epochs / args.batch_size)
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
-    else:
-        train_sampler = None
-        val_sampler = None
-
-    mixup = v2.MixUp(alpha=0.2, num_classes=1000)
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler,
-        collate_fn=lambda batch: mixup(*torch.utils.data.default_collate(batch)), drop_last=True)
-
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, sampler=val_sampler)
-
-    warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: step / args.warmup)
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - args.warmup)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [args.warmup])
-
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            if args.gpu is None:
-                checkpoint = torch.load(args.resume)
-            elif torch.cuda.is_available():
-                # Map model to be loaded to specified single gpu.
-                loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
-            args.start_step = checkpoint['step']
-            best_acc1 = checkpoint['best_acc1']
-            if args.gpu is not None:
-                # best_acc1 may be from a checkpoint from a different GPU
-                best_acc1 = best_acc1.to(args.gpu)
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
-            print("=> loaded checkpoint '{}' (step {})"
-                  .format(args.resume, checkpoint['step']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-
-    if args.wandb and is_master(args):
-        wandb.init(
-            project="mup-vit",
-            name=args.name,
-            id=args.name,
-            notes=args.wandb_notes,
-            tags=[],
-            resume='auto',
-            config=vars(args),
-        )
-        params_file = os.path.join(args.logs, args.name, "params.txt")
-        wandb.save(params_file)
-
-    # Pytorch 2.0 adds '_orig_mod.' prefix to keys of state_dict() of compiled models.
-    # For compatibility, we save state_dict() of the original model, which shares the
-    # weights without the prefix.
-    print('Compiling model...')
-    original_model = model
-    model = torch.compile(original_model)
-
-    if args.evaluate:
-        # evaluate on validation set.
-        # I got RuntimeError: Found a custom (non-ATen) operator that either mutates or its inputs: aten::record_stream..
-        # if I use the compiled model, so for now I pass in original_model instead.
-        validate(val_loader, original_model, criterion, args.start_step, args)
-        return
-
-    train(train_loader, val_loader, args.start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device, args)
-
-
-def train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device, args):
-    batch_time = AverageMeter('Time', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(
-        total_steps,
-        [batch_time, data_time, losses, top1, top5])
-
-    # switch to train mode
-    model.train()
-    end = time.time()
-    best_acc1 = 0
-
-    def infinite_loader():
-        while True:
-            yield from train_loader
-
-    for step, (images, target) in zip(range(start_step + 1, total_steps + 1), infinite_loader()):
-        # measure data loading time
-        data_time.update(time.time() - end)
-
-        # move data to the same device as model
-        images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
-        step_loss = step_acc1 = step_acc5 = 0.0
-
-        for img, trt in zip(images.chunk(args.accum_freq), target.chunk(args.accum_freq)):
-            # compute output
-            output = model(img)
-            loss = criterion(output, trt)
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, trt, topk=(1, 5), class_prob=True)
-            step_loss += loss.item()
-            step_acc1 += acc1[0].item()
-            step_acc5 += acc5[0].item()
-
-            # compute gradient
-            (loss / args.accum_freq).backward()
-
-        step_loss /= args.accum_freq
-        step_acc1 /= args.accum_freq
-        step_acc5 /= args.accum_freq
-
-        losses.update(step_loss, images.size(0))
-        top1.update(step_acc1, images.size(0))
-        top5.update(step_acc5, images.size(0))
-
-        # do SGD step
-        l2_grads = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if step % args.print_freq == 0:
-            progress.display(step)
-            if args.wandb and is_master(args):
-
-                with torch.no_grad():
-                    l2_params = sum(p.square().sum().item() for _, p in model.named_parameters())
-
-                samples_per_second_per_gpu = args.batch_size / batch_time.val
-                samples_per_second = samples_per_second_per_gpu * args.world_size
-                log_data = {
-                    "train/loss": step_loss,
-                    'train/acc@1': step_acc1,
-                    'train/acc@5': step_acc5,
-                    "data_time": data_time.val,
-                    "batch_time": batch_time.val,
-                    "samples_per_second": samples_per_second,
-                    "samples_per_second_per_gpu": samples_per_second_per_gpu,
-                    "lr": scheduler.get_last_lr()[0],
-                    "l2_grads": l2_grads.item(),
-                    "l2_params": math.sqrt(l2_params)
-                }
-                wandb.log(log_data, step=step)
-
-        if step % args.log_steps == 0 or step == total_steps:
-
-            acc1 = validate(val_loader, original_model, criterion, step, args)
-
-            # remember best acc@1 and save checkpoint
-            is_best = acc1 > best_acc1
-            best_acc1 = max(acc1, best_acc1)
-
-            if is_master(args):
-                save_checkpoint({
-                    'step': step,
-                    'state_dict': original_model.state_dict(),
-                    'best_acc1': best_acc1,
-                    'optimizer' : optimizer.state_dict(),
-                    'scheduler' : scheduler.state_dict()
-                }, is_best, args.checkpoint_path)
-
-        scheduler.step()
-
-
-def validate(val_loader, model, criterion, step, args):
-
-    def run_validate(loader, base_progress=0):
-        with torch.no_grad():
-            torch.cuda.empty_cache()
-            end = time.time()
-            for i, (images, target) in enumerate(loader):
-                i = base_progress + i
-                if args.gpu is not None and torch.cuda.is_available():
-                    images = images.cuda(args.gpu, non_blocking=True)
-                if torch.backends.mps.is_available():
-                    images = images.to('mps')
-                    target = target.to('mps')
-                if torch.cuda.is_available():
-                    target = target.cuda(args.gpu, non_blocking=True)
-
-                for img, trt in zip(images.chunk(args.accum_freq), target.chunk(args.accum_freq)):
-                    # compute output
-                    output = model(img)
-                    loss = criterion(output, trt)
-
-                    # measure accuracy and record loss
-                    acc1, acc5 = accuracy(output, trt, topk=(1, 5))
-                    losses.update(loss.item(), img.size(0))
-                    top1.update(acc1[0].item(), img.size(0))
-                    top5.update(acc5[0].item(), img.size(0))
-                    
-                # measure elapsed time
-                batch_time.update(time.time() - end)
-                end = time.time()
-
-                if i % args.print_freq == 0:
-                    progress.display(i)
-
-    batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
-    losses = AverageMeter('Loss', ':.4e', Summary.NONE)
-    top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
-    top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
-    progress = ProgressMeter(
-        len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
-        [batch_time, losses, top1, top5],
-        prefix='Test: ')
-
-    # switch to evaluate mode
-    model.eval()
-
-    run_validate(val_loader)
-    if args.distributed:
-        top1.all_reduce()
-        top5.all_reduce()
-
-    if args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset)):
-        aux_val_dataset = Subset(val_loader.dataset,
-                                 range(len(val_loader.sampler) * args.world_size, len(val_loader.dataset)))
-        aux_val_loader = torch.utils.data.DataLoader(
-            aux_val_dataset, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True)
-        run_validate(aux_val_loader, len(val_loader))
-
-    progress.display_summary()
-
-    if args.wandb and is_master(args):        
-        log_data = {
-            'val/loss': losses.avg,
-            'val/acc@1': top1.avg,
-            'val/acc@5': top5.avg,
-        }
-        wandb.log(log_data, step=step)
-
-    return top1.avg
-
-
-def save_checkpoint(state, is_best, path, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, path, filename='imagenet_average_patchconvcheckpoint.pth.tar'):
     filename = os.path.join(path, filename)
     torch.save(state, filename)
     if is_best:
@@ -534,7 +343,7 @@ class AverageMeter(object):
         self.fmt = fmt
         self.summary_type = summary_type
         self.reset()
-
+        
     def reset(self):
         self.val = 0
         self.avg = 0
@@ -558,7 +367,7 @@ class AverageMeter(object):
         dist.all_reduce(total, dist.ReduceOp.SUM, async_op=False)
         self.sum, self.count = total.tolist()
         self.avg = self.sum / self.count
-
+    
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
@@ -577,8 +386,6 @@ class AverageMeter(object):
             raise ValueError('invalid summary type %r' % self.summary_type)
         
         return fmtstr.format(**self.__dict__)
-
-
 class ProgressMeter(object):
     def __init__(self, num_batches, meters, prefix=""):
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
@@ -620,7 +427,177 @@ def accuracy(output, target, topk=(1,), class_prob=False):
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(1.0 / batch_size))
         return res
+    
+log_steps = 2500
 
+# Initialize a new run
+wandb.init(project="fractual_transformer", name="ImageNet_AvgConv_run")
 
-if __name__ == '__main__':
-    main()
+def validate(val_loader, model, criterion, step, use_wandb=False, accum_freq=1, print_freq=100):
+    
+    def run_validate(loader, base_progress=0):
+        with torch.no_grad():
+            torch.cuda.empty_cache()
+            end = time.time()
+            for i, (images, target) in enumerate(loader):
+                i = base_progress + i
+
+                if torch.cuda.is_available():
+                    images = images.cuda(non_blocking=True)
+                    target = target.cuda(non_blocking=True)
+                elif torch.backends.mps.is_available():
+                    images = images.to('mps')
+                    target = target.to('mps')
+
+                for img, trt in zip(images.chunk(accum_freq), target.chunk(accum_freq)):
+                    # compute output
+                    output = model(img)
+                    loss = criterion(output, trt)
+
+                    # measure accuracy and record loss
+                    acc1, acc5 = accuracy(output, trt, topk=(1, 5))
+                    losses.update(loss.item(), img.size(0))
+                    top1.update(acc1[0].item(), img.size(0))
+                    top5.update(acc5[0].item(), img.size(0))
+                    
+                # measure elapsed time
+                batch_time.update(time.time() - end)
+                end = time.time()
+
+                if i % print_freq == 0:
+                    progress.display(i)
+
+    batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
+    losses = AverageMeter('Loss', ':.4e', Summary.NONE)
+    top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
+    top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time, losses, top1, top5],
+        prefix='Test: ')
+
+    # switch to evaluate mode
+    model.eval()
+
+    run_validate(val_loader)
+
+    progress.display_summary()
+
+    if use_wandb:        
+        log_data = {
+            'val/loss': losses.avg,
+            'val/acc@1': top1.avg,
+            'val/acc@5': top5.avg,
+        }
+        wandb.log(log_data, step=step)
+
+    return top1.avg
+
+def train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device):
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    print_freq = 100  # Print frequency (adjust as needed)
+    log_steps = 2500  # Log steps (adjust as needed)
+    accum_freq = 1  # Gradient accumulation frequency (adjust as needed)
+    
+    progress = ProgressMeter(
+        total_steps,
+        [batch_time, data_time, losses, top1, top5]
+    )
+
+    # switch to train mode
+    model.train()
+    end = time.time()
+    best_acc1 = 0
+    
+    def infinite_loader():
+        while True:
+            yield from train_loader
+
+    for step, (images, target) in zip(range(start_step + 1, total_steps + 1), infinite_loader()):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        # move data to the same device as model
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        step_loss = step_acc1 = step_acc5 = 0.0
+
+        for img, trt in zip(images.chunk(accum_freq), target.chunk(accum_freq)):
+            # compute output
+            output = model(img)
+            loss = criterion(output, trt)
+
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, trt, topk=(1, 5), class_prob=True)
+            step_loss += loss.item()
+            step_acc1 += acc1[0].item()
+            step_acc5 += acc5[0].item()
+            
+            # compute gradient
+            (loss / accum_freq).backward()
+
+        step_loss /= accum_freq
+        step_acc1 /= accum_freq
+        step_acc5 /= accum_freq
+
+        losses.update(step_loss, images.size(0))
+        top1.update(step_acc1, images.size(0))
+        top5.update(step_acc5, images.size(0))
+        
+         # do SGD step
+        l2_grads = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if step % print_freq == 0:
+            print(step)
+            progress.display(step)
+            if wandb:
+                
+                with torch.no_grad():
+                    l2_params = sum(p.square().sum().item() for _, p in model.named_parameters())
+
+                samples_per_second_per_gpu = batch_size / batch_time.val
+                samples_per_second = samples_per_second_per_gpu 
+                log_data = {
+                    "train/loss": step_loss,
+                    'train/acc@1': step_acc1,
+                    'train/acc@5': step_acc5,
+                    "data_time": data_time.val,
+                    "batch_time": batch_time.val,
+                    "samples_per_second": samples_per_second,
+                    "samples_per_second_per_gpu": samples_per_second_per_gpu,
+                    "lr": scheduler.get_last_lr()[0],
+                    "l2_grads": l2_grads.item(),
+                    "l2_params": math.sqrt(l2_params)
+                }
+                wandb.log(log_data, step=step)
+
+        if step % log_steps == 0 or step == total_steps:
+            
+            acc1 = validate(val_loader, original_model, criterion, step)
+
+            # remember best acc@1 and save checkpoint
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
+            
+            save_checkpoint({
+                'step': step,
+                'state_dict': original_model.state_dict(),
+                'best_acc1': best_acc1,
+                'optimizer' : optimizer.state_dict(),
+                'scheduler' : scheduler.state_dict()
+            }, is_best,checkpoint_path)
+
+        scheduler.step()
+        
+
+train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
