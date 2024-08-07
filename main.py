@@ -12,12 +12,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
-import torchvision.datasets as datasets
 from torchvision.transforms import v2
 import torchvision.transforms as transforms
 from typing import Any, Dict, Union, Type, Callable, Optional, List
 from torchvision.models.vision_transformer import MLPBlock
 import wandb
+import json
+from PIL import Image
+from torch.utils.data import Dataset
 
 num_epochs=90
 
@@ -26,31 +28,83 @@ batch_size = 128
 num_workers = 4 
 
 # Dataset loading code
-# Define CIFAR-10 datasets with image size 256x256
-# Needs to be replaced by ImagNet image size256,256
+# ImageNet image size (256,256)
 
-train_dataset = datasets.CIFAR10(
-    root='./data',
-    train=True,
-    download=True,
-    transform=transforms.Compose([
-        transforms.RandomResizedCrop(256, scale=(0.05, 1.0)),  # Change to 256x256
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
+class ImageNet100Dataset(Dataset):
+    def __init__(self, root_dirs, labels_file, transform=None):
+        self.transform = transform
+        self.images = []
+        self.labels = []
+        self.label_to_idx = {}  # Map from string label to numerical index
+        
+        # Load labels
+        with open(labels_file, 'r') as f:
+            label_dict = json.load(f)
+        
+        # Create label to index mapping
+        unique_labels = sorted(label_dict.keys())
+        self.label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
+        
+        # Load image paths and labels
+        for root_dir in root_dirs:
+            for label in os.listdir(root_dir):
+                label_path = os.path.join(root_dir, label)
+                if os.path.isdir(label_path):
+                    for img_name in os.listdir(label_path):
+                        img_path = os.path.join(label_path, img_name)
+                        self.images.append(img_path)
+                        self.labels.append(self.label_to_idx[label])
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        # Convert label to tensor
+        label = torch.tensor(label)
+        
+        return image, label
+
+# Define transformations
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(256, scale=(0.05, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# Create the datasets
+train_dirs = [
+    '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/train.X1',
+    '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/train.X2',
+    '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/train.X3',
+    '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/train.X4'
+]
+val_dir = ['/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/val.X']
+labels_file = '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/Labels.json'
+
+train_dataset = ImageNet100Dataset(
+    root_dirs=train_dirs,
+    labels_file=labels_file,
+    transform=train_transform
 )
 
-val_dataset = datasets.CIFAR10(
-    root='./data',
-    train=False,
-    download=True,
-    transform=transforms.Compose([
-        transforms.Resize(256),  # Resize to 256
-        transforms.CenterCrop(256),  # Center crop to 256x256
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
+val_dataset = ImageNet100Dataset(
+    root_dirs=val_dir,
+    labels_file=labels_file,
+    transform=val_transform
 )
 
 n = len(train_dataset)
@@ -59,7 +113,7 @@ total_steps = round((n * num_epochs) / batch_size)
 
 start_step=0
 
-mixup = v2.MixUp(alpha=0.2, num_classes=10)
+mixup = v2.MixUp(alpha=0.2, num_classes=100)
 
 train_loader = torch.utils.data.DataLoader(
     train_dataset,
@@ -217,7 +271,7 @@ class SimpleVisionTransformer(nn.Module):
         mlp_dim: int,
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
-        num_classes: int = 10, # No. of classes have to be changed to 1000 for imagenet
+        num_classes: int = 100, # No. of classes
         seq_length: int = 273,  # 256 + 16 + 1
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
@@ -322,7 +376,7 @@ cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps
 scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [warmup_try])
 
 #Change_path_for_the_directory;This is the directory where model weights are to be saved
-checkpoint_path = "/kaggle/working/"
+checkpoint_path = "/home/shivank_g.iitr/vlg/fractal/Model_History"
 
 def save_checkpoint(state, is_best, path, filename='imagenet_average_patchconvcheckpoint.pth.tar'):
     filename = os.path.join(path, filename)
@@ -430,8 +484,10 @@ def accuracy(output, target, topk=(1,), class_prob=False):
     
 log_steps = 2500
 
+wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
+
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet_AvgConv_run")
+wandb.init(project="fractual_transformer", name="ImageNet100_AvgConv_run")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, accum_freq=1, print_freq=100):
     
@@ -601,3 +657,5 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
         
 
 train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
+
+wandb.finish()
