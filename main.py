@@ -131,18 +131,53 @@ val_loader = torch.utils.data.DataLoader(
 
 warmup_try=10000
 
-# Taken from https://github.com/lucidrains/vit-pytorch, likely ported from https://github.com/google-research/big_vision/
-def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
-    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
-    assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
-    omega = torch.arange(dim // 4) / (dim // 4 - 1)
-    omega = 1.0 / (temperature ** omega)
-
-    y = y.flatten()[:, None] * omega[None, :]
-    x = x.flatten()[:, None] * omega[None, :]
-    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
-    return pe.type(dtype)
-
+class PatchExtractor(nn.Module):
+    def __init__(self, image_size=256, patch_size=16, in_channels=3, embed_dim=384):
+        super(PatchExtractor, self).__init__()
+        
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_patches_original = (image_size // patch_size) ** 2
+        self.num_patches_downsampled_64 = ((image_size // 4) // patch_size) ** 2
+        self.num_patches_downsampled_16 = 1  # 16x16 image gives 1 patch of 16x16
+        
+        self.projection= nn.Conv2d(in_channels=in_channels, out_channels=embed_dim,kernel_size=patch_size, stride=patch_size, padding=0, bias=False)
+        
+        self.downsample = nn.AvgPool2d(kernel_size=4, stride=4, padding=0)
+        
+        self.embed_dim = embed_dim
+        
+    def forward(self, x):
+        # x shape: (batch_size, in_channels, 256, 256)
+        
+        # Process original image
+        x_original = self.projection(x)
+        x_original = x_original.flatten(2).transpose(1, 2)
+        # x_original shape: (batch_size, 256, embed_dim)
+        
+        # Downsample to 64x64
+        x_64 = self.downsample(x)
+        # x_64 shape: (batch_size, in_channels, 64, 64)
+        
+        # Process 64x64 image
+        x_64_patches = self.projection(x_64)
+        x_64_patches = x_64_patches.flatten(2).transpose(1, 2)
+        # x_64_patches shape: (batch_size, 16, embed_dim)
+        
+        # Downsample to 16x16
+        x_16 = self.downsample(x_64)
+        # x_16 shape: (batch_size, in_channels, 16, 16)
+        
+        # Process 16x16 image
+        x_16_patch = self.projection(x_16)
+        x_16_patch = x_16_patch.flatten(2).transpose(1, 2)
+        # x_16_patches shape: (batch_size, 1, embed_dim)
+        
+        # Concatenate all
+        x_combined = torch.cat([x_original, x_64_patches, x_16_patch], dim=1)
+        # x_combined shape: (batch_size, 273, embed_dim)
+        
+        return x_combined
 
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
@@ -232,7 +267,8 @@ class SimpleVisionTransformer(nn.Module):
         mlp_dim: int,
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
-        num_classes: int = 100,
+        num_classes: int = 100, # No. of classes
+        seq_length: int = 273,  # 256 + 16 + 1
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
     ):
@@ -248,14 +284,12 @@ class SimpleVisionTransformer(nn.Module):
         self.representation_size = representation_size
         self.norm_layer = norm_layer
 
-        self.conv_proj = nn.Conv2d(
-            in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
-        )
-
-        h = w = image_size // patch_size
-        seq_length = h * w
-        self.register_buffer("pos_embedding", posemb_sincos_2d(h=h, w=w, dim=hidden_dim))
-
+        # Add PatchExtractor
+        self.patch_extractor = PatchExtractor(image_size=image_size, patch_size=patch_size, in_channels=3, embed_dim=hidden_dim)
+        
+        # Update seq_length to match the number of tokens from TokenGenerator
+        self.seq_length = seq_length
+        
         self.encoder = Encoder(
             seq_length,
             num_layers,
@@ -277,23 +311,8 @@ class SimpleVisionTransformer(nn.Module):
             heads_layers["head"] = nn.Linear(representation_size, num_classes)
 
         self.heads = nn.Sequential(heads_layers)
-
-        if isinstance(self.conv_proj, nn.Conv2d):
-            # Init the patchify stem
-            fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1]
-            # constant is stddev of standard normal truncated to (-2, 2)
-            std = math.sqrt(1 / fan_in) / .87962566103423978
-            nn.init.trunc_normal_(self.conv_proj.weight, std=std, a=-2 * std, b=2 * std)
-            if self.conv_proj.bias is not None:
-                nn.init.zeros_(self.conv_proj.bias)
-        elif self.conv_proj.conv_last is not None and isinstance(self.conv_proj.conv_last, nn.Conv2d):
-            # Init the last 1x1 conv of the conv stem
-            nn.init.normal_(
-                self.conv_proj.conv_last.weight, mean=0.0, std=math.sqrt(2.0 / self.conv_proj.conv_last.out_channels)
-            )
-            if self.conv_proj.conv_last.bias is not None:
-                nn.init.zeros_(self.conv_proj.conv_last.bias)
-
+        
+        # Initialize weights for the heads
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
             fan_in = self.heads.pre_logits.in_features
             nn.init.trunc_normal_(self.heads.pre_logits.weight, std=math.sqrt(1 / fan_in))
@@ -303,37 +322,18 @@ class SimpleVisionTransformer(nn.Module):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
 
-    def _process_input(self, x: torch.Tensor) -> torch.Tensor:
-        n, c, h, w = x.shape
-        p = self.patch_size
-        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
-        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
-        n_h = h // p
-        n_w = w // p
-
-        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
-        x = self.conv_proj(x)
-        
-        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
-        x = x.reshape(n, self.hidden_dim, n_h * n_w)
-        
-        
-        
-        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
-        # The self attention layer expects inputs in the format (N, S, E)
-        # where S is the source sequence length, N is the batch size, E is the
-        # embedding dimension
-        x = x.permute(0, 2, 1)
-        
-        return x
 
     def forward(self, x: torch.Tensor):
-        # Reshape and permute the input tensor
-        x = self._process_input(x)
+        # Use TokenGenerator to get tokens
+        #print(x.shape)
+        x = self.patch_extractor(x)  # Shape: [B,5, hidden_dim]
+        #print(x.shape)
         x = self.encoder(x)
+        #print(x.shape)
         x = x.mean(dim = 1)
+        #print(x.shape)
         x = self.heads(x)
-
+        #print(x.shape)
         return x
     
 def weight_decay_param(n, p):
@@ -378,7 +378,7 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [
 #Change_path_for_the_directory;This is the directory where model weights are to be saved
 checkpoint_path = "/kaggle/working/"
 
-def save_checkpoint(state, is_best, path, filename='imagenet_baseline__without_positional_embeddingpatchconvcheckpoint.pth.tar'):
+def save_checkpoint(state, is_best, path, filename='imagenet_average_patchconvcheckpoint.pth.tar'):
     filename = os.path.join(path, filename)
     torch.save(state, filename)
     if is_best:
@@ -386,7 +386,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline__without_p
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'BaseLine_VIT_without_PE.pt')
+    filename = os.path.join(checkpoint_path, f'AVG_VIT.pt')
     
     # Save the checkpoint
     torch.save({
@@ -501,7 +501,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_Without_PE_run")
+wandb.init(project="fractual_transformer", name="ImageNet100_AvgConv_run")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
@@ -551,6 +551,8 @@ def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100
     run_validate(val_loader)
 
     progress.display_summary()
+
+    print(1)
     
     if use_wandb:        
         log_data = {
