@@ -21,11 +21,10 @@ import json
 from PIL import Image
 from torch.utils.data import Dataset
 
-num_epochs=90
+num_epochs=30
 
-# Parameters specific to CIFAR-10
-batch_size = 128
-num_workers = 4 
+# Parameters specific to ImageNet100
+batch_size = 256
 
 # Dataset loading code
 # ImageNet image size (256,256)
@@ -80,20 +79,20 @@ train_transform = transforms.Compose([
 ])
 
 val_transform = transforms.Compose([
-    transforms.Resize(256),
+    transforms.Resize((256,256)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 # Create the datasets
 train_dirs = [
-    '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/train.X1',
-    '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/train.X2',
-    '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/train.X3',
-    '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/train.X4'
+    '/kaggle/input/imagenet100/train.X1',
+    '/kaggle/input/imagenet100/train.X2',
+    '/kaggle/input/imagenet100/train.X3',
+    '/kaggle/input/imagenet100/train.X4'
 ]
-val_dir = ['/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/val.X']
-labels_file = '/home/shivank_g.iitr/vlg/fractal/Dataset_imagenet/Labels.json'
+val_dir = ['/kaggle/input/imagenet100/val.X']
+labels_file = '/kaggle/input/imagenet100/Labels.json'
 
 train_dataset = ImageNet100Dataset(
     root_dirs=train_dirs,
@@ -119,8 +118,6 @@ train_loader = torch.utils.data.DataLoader(
     train_dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=num_workers,
-    pin_memory=True,
     collate_fn=lambda batch: mixup(*torch.utils.data.default_collate(batch)), 
     drop_last=True
 )
@@ -129,59 +126,23 @@ val_loader = torch.utils.data.DataLoader(
     val_dataset,
     batch_size=batch_size,
     shuffle=False,
-    num_workers=num_workers,
-    pin_memory=True
+    drop_last=True
 )
 
 warmup_try=10000
 
-class PatchExtractor(nn.Module):
-    def __init__(self, image_size=256, patch_size=16, in_channels=3, embed_dim=384):
-        super(PatchExtractor, self).__init__()
-        
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.num_patches_original = (image_size // patch_size) ** 2
-        self.num_patches_downsampled_64 = ((image_size // 4) // patch_size) ** 2
-        self.num_patches_downsampled_16 = 1  # 16x16 image gives 1 patch of 16x16
-        
-        self.projection= nn.Conv2d(in_channels=in_channels, out_channels=embed_dim,kernel_size=patch_size, stride=patch_size, padding=0, bias=False)
-        
-        self.downsample = nn.AvgPool2d(kernel_size=4, stride=4, padding=0)
-        
-        self.embed_dim = embed_dim
-        
-    def forward(self, x):
-        # x shape: (batch_size, in_channels, 256, 256)
-        
-        # Process original image
-        x_original = self.projection(x)
-        x_original = x_original.flatten(2).transpose(1, 2)
-        # x_original shape: (batch_size, 256, embed_dim)
-        
-        # Downsample to 64x64
-        x_64 = self.downsample(x)
-        # x_64 shape: (batch_size, in_channels, 64, 64)
-        
-        # Process 64x64 image
-        x_64_patches = self.projection(x_64)
-        x_64_patches = x_64_patches.flatten(2).transpose(1, 2)
-        # x_64_patches shape: (batch_size, 16, embed_dim)
-        
-        # Downsample to 16x16
-        x_16 = self.downsample(x_64)
-        # x_16 shape: (batch_size, in_channels, 16, 16)
-        
-        # Process 16x16 image
-        x_16_patch = self.projection(x_16)
-        x_16_patch = x_16_patch.flatten(2).transpose(1, 2)
-        # x_16_patches shape: (batch_size, 1, embed_dim)
-        
-        # Concatenate all
-        x_combined = torch.cat([x_original, x_64_patches, x_16_patch], dim=1)
-        # x_combined shape: (batch_size, 273, embed_dim)
-        
-        return x_combined
+# Taken from https://github.com/lucidrains/vit-pytorch, likely ported from https://github.com/google-research/big_vision/
+def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
+    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
+    omega = torch.arange(dim // 4) / (dim // 4 - 1)
+    omega = 1.0 / (temperature ** omega)
+
+    y = y.flatten()[:, None] * omega[None, :]
+    x = x.flatten()[:, None] * omega[None, :]
+    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
+    return pe.type(dtype)
+
 
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
@@ -271,8 +232,7 @@ class SimpleVisionTransformer(nn.Module):
         mlp_dim: int,
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
-        num_classes: int = 100, # No. of classes
-        seq_length: int = 273,  # 256 + 16 + 1
+        num_classes: int = 100,
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
     ):
@@ -288,12 +248,14 @@ class SimpleVisionTransformer(nn.Module):
         self.representation_size = representation_size
         self.norm_layer = norm_layer
 
-        # Add PatchExtractor
-        self.patch_extractor = PatchExtractor(image_size=image_size, patch_size=patch_size, in_channels=3, embed_dim=hidden_dim)
-        
-        # Update seq_length to match the number of tokens from TokenGenerator
-        self.seq_length = seq_length
-        
+        self.conv_proj = nn.Conv2d(
+            in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
+        )
+
+        h = w = image_size // patch_size
+        seq_length = h * w
+        self.register_buffer("pos_embedding", posemb_sincos_2d(h=h, w=w, dim=hidden_dim))
+
         self.encoder = Encoder(
             seq_length,
             num_layers,
@@ -315,8 +277,23 @@ class SimpleVisionTransformer(nn.Module):
             heads_layers["head"] = nn.Linear(representation_size, num_classes)
 
         self.heads = nn.Sequential(heads_layers)
-        
-        # Initialize weights for the heads
+
+        if isinstance(self.conv_proj, nn.Conv2d):
+            # Init the patchify stem
+            fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1]
+            # constant is stddev of standard normal truncated to (-2, 2)
+            std = math.sqrt(1 / fan_in) / .87962566103423978
+            nn.init.trunc_normal_(self.conv_proj.weight, std=std, a=-2 * std, b=2 * std)
+            if self.conv_proj.bias is not None:
+                nn.init.zeros_(self.conv_proj.bias)
+        elif self.conv_proj.conv_last is not None and isinstance(self.conv_proj.conv_last, nn.Conv2d):
+            # Init the last 1x1 conv of the conv stem
+            nn.init.normal_(
+                self.conv_proj.conv_last.weight, mean=0.0, std=math.sqrt(2.0 / self.conv_proj.conv_last.out_channels)
+            )
+            if self.conv_proj.conv_last.bias is not None:
+                nn.init.zeros_(self.conv_proj.conv_last.bias)
+
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
             fan_in = self.heads.pre_logits.in_features
             nn.init.trunc_normal_(self.heads.pre_logits.weight, std=math.sqrt(1 / fan_in))
@@ -326,18 +303,37 @@ class SimpleVisionTransformer(nn.Module):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
 
+    def _process_input(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.shape
+        p = self.patch_size
+        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
+        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        n_h = h // p
+        n_w = w // p
+
+        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
+        x = self.conv_proj(x)
+        
+        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
+        x = x.reshape(n, self.hidden_dim, n_h * n_w)
+        
+        
+        
+        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+        # The self attention layer expects inputs in the format (N, S, E)
+        # where S is the source sequence length, N is the batch size, E is the
+        # embedding dimension
+        x = x.permute(0, 2, 1)
+        
+        return x
 
     def forward(self, x: torch.Tensor):
-        # Use TokenGenerator to get tokens
-        #print(x.shape)
-        x = self.patch_extractor(x)  # Shape: [B,5, hidden_dim]
-        #print(x.shape)
+        # Reshape and permute the input tensor
+        x = self._process_input(x)
         x = self.encoder(x)
-        #print(x.shape)
         x = x.mean(dim = 1)
-        #print(x.shape)
         x = self.heads(x)
-        #print(x.shape)
+
         return x
     
 def weight_decay_param(n, p):
@@ -353,7 +349,11 @@ model = SimpleVisionTransformer(
     num_heads=6,
     hidden_dim=384,
     mlp_dim=1536,
-).to(device)
+)
+
+model = nn.DataParallel(model)
+model.to('cuda')
+
 wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
 non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
 
@@ -376,13 +376,27 @@ cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps
 scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [warmup_try])
 
 #Change_path_for_the_directory;This is the directory where model weights are to be saved
-checkpoint_path = "/home/shivank_g.iitr/vlg/fractal/Model_History"
+checkpoint_path = "/kaggle/working/"
 
-def save_checkpoint(state, is_best, path, filename='imagenet_average_patchconvcheckpoint.pth.tar'):
+def save_checkpoint(state, is_best, path, filename='imagenet_baseline__without_positional_embeddingpatchconvcheckpoint.pth.tar'):
     filename = os.path.join(path, filename)
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, os.path.join(path, 'model_best.pth.tar'))
+
+def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
+    # Define the filename with the current step
+    filename = os.path.join(checkpoint_path, f'BaseLine_VIT_without_PE.pt')
+    
+    # Save the checkpoint
+    torch.save({
+        'step': step,
+        'state_dict': model.state_dict(),
+        'best_acc1': best_acc1,
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict()
+    }, filename)
+    
 
 class Summary(Enum):
     NONE = 0
@@ -487,9 +501,9 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_AvgConv_run")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_Without_PE_run")
 
-def validate(val_loader, model, criterion, step, use_wandb=False, accum_freq=1, print_freq=100):
+def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
     def run_validate(loader, base_progress=0):
         with torch.no_grad():
@@ -505,16 +519,15 @@ def validate(val_loader, model, criterion, step, use_wandb=False, accum_freq=1, 
                     images = images.to('mps')
                     target = target.to('mps')
 
-                for img, trt in zip(images.chunk(accum_freq), target.chunk(accum_freq)):
-                    # compute output
-                    output = model(img)
-                    loss = criterion(output, trt)
+                # compute output
+                output = model(images)
+                loss = criterion(output,target)
 
-                    # measure accuracy and record loss
-                    acc1, acc5 = accuracy(output, trt, topk=(1, 5))
-                    losses.update(loss.item(), img.size(0))
-                    top1.update(acc1[0].item(), img.size(0))
-                    top5.update(acc5[0].item(), img.size(0))
+                # measure accuracy and record loss
+                acc1, acc5 = accuracy(output,target, topk=(1, 5))
+                losses.update(loss.item(),images.size(0))
+                top1.update(acc1[0].item(),images.size(0))
+                top5.update(acc5[0].item(),images.size(0))
                     
                 # measure elapsed time
                 batch_time.update(time.time() - end)
@@ -538,7 +551,7 @@ def validate(val_loader, model, criterion, step, use_wandb=False, accum_freq=1, 
     run_validate(val_loader)
 
     progress.display_summary()
-
+    
     if use_wandb:        
         log_data = {
             'val/loss': losses.avg,
@@ -557,7 +570,6 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
     top5 = AverageMeter('Acc@5', ':6.2f')
     print_freq = 100  # Print frequency (adjust as needed)
     log_steps = 2500  # Log steps (adjust as needed)
-    accum_freq = 1  # Gradient accumulation frequency (adjust as needed)
     
     progress = ProgressMeter(
         total_steps,
@@ -581,30 +593,23 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
         step_loss = step_acc1 = step_acc5 = 0.0
-
-        for img, trt in zip(images.chunk(accum_freq), target.chunk(accum_freq)):
-            # compute output
-            output = model(img)
-            loss = criterion(output, trt)
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, trt, topk=(1, 5), class_prob=True)
-            step_loss += loss.item()
-            step_acc1 += acc1[0].item()
-            step_acc5 += acc5[0].item()
-            
-            # compute gradient
-            (loss / accum_freq).backward()
-
-        step_loss /= accum_freq
-        step_acc1 /= accum_freq
-        step_acc5 /= accum_freq
-
+        
+        output = model(images)
+        loss = criterion(output,target)
+        
+        
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5), class_prob=True)
+        step_loss += loss.item()
+        step_acc1 += acc1[0].item()
+        step_acc5 += acc5[0].item()
+        
         losses.update(step_loss, images.size(0))
         top1.update(step_acc1, images.size(0))
         top5.update(step_acc5, images.size(0))
         
-         # do SGD step
+        # compute gradient and do SGD step
+        loss.backward()
         l2_grads = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
@@ -612,7 +617,7 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-
+        
         if step % print_freq == 0:
             print(step)
             progress.display(step)
@@ -620,7 +625,7 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
                 
                 with torch.no_grad():
                     l2_params = sum(p.square().sum().item() for _, p in model.named_parameters())
-
+                    
                 samples_per_second_per_gpu = batch_size / batch_time.val
                 samples_per_second = samples_per_second_per_gpu 
                 log_data = {
@@ -636,8 +641,27 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
                     "l2_params": math.sqrt(l2_params)
                 }
                 wandb.log(log_data, step=step)
-
-        if step % log_steps == 0 or step == total_steps:
+        
+        if ((step % print_freq == 0) and ((step % log_steps != 0) and (step != total_steps))):        
+            
+            save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path)
+                
+        if step % log_steps == 0:
+            
+            acc1 = validate(val_loader, original_model, criterion, step)
+            # remember best acc@1 and save checkpoint
+            is_best = acc1 > best_acc1
+            best_acc1 = max(acc1, best_acc1)
+            
+            save_checkpoint({
+                'step': step,
+                'state_dict': original_model.state_dict(),
+                'best_acc1': best_acc1,
+                'optimizer' : optimizer.state_dict(),
+                'scheduler' : scheduler.state_dict()
+            }, is_best,checkpoint_path)
+            
+        elif step == total_steps:
             
             acc1 = validate(val_loader, original_model, criterion, step)
 
@@ -652,10 +676,11 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
             }, is_best,checkpoint_path)
+            
 
         scheduler.step()
         
 
-train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
+train(train_loader,val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
 
 wandb.finish()
