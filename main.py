@@ -1,5 +1,5 @@
 ### Necessary Imports and dependencies
-### Wandb project_name is ImageNet_Avg_Conv2D
+### Wandb project_name is ImageNet_Dilated_Conv2D
 import os
 import shutil
 import time
@@ -131,57 +131,68 @@ val_loader = torch.utils.data.DataLoader(
 
 warmup_try=10000
 
-class PatchExtractor(nn.Module):
+class DilatedConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dilation):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.activation = nn.ReLU()
+
+    def forward(self, x):
+        return self.activation(self.bn(self.conv(x)))
+
+class TokenGenerator(nn.Module):
     def __init__(self, image_size=256, patch_size=16, in_channels=3, embed_dim=384):
-        super(PatchExtractor, self).__init__()
+        super().__init__()
         
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.num_patches_original = (image_size // patch_size) ** 2
-        self.num_patches_downsampled_64 = ((image_size // 4) // patch_size) ** 2
-        self.num_patches_downsampled_16 = 1  # 16x16 image gives 1 patch of 16x16
+        self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
         
-        self.projection= nn.Conv2d(in_channels=in_channels, out_channels=embed_dim,kernel_size=patch_size, stride=patch_size, padding=0, bias=False)
+        self.stage1 = DilatedConvBlock(embed_dim, embed_dim, dilation=1)
+        self.stage2 = DilatedConvBlock(embed_dim, embed_dim, dilation=4)
         
-        self.downsample = nn.Sequential(
-            nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=4, stride=4),
-            nn.GELU(),
-        )
+        self._init_weights()
         
-        self.embed_dim = embed_dim
+    def _init_weights(self):
+        # Initialize patch_embed (equivalent to conv_proj in the original code)
+        fan_in = self.patch_embed.in_channels * self.patch_embed.kernel_size[0] * self.patch_embed.kernel_size[1]
+        std = math.sqrt(1 / fan_in) / .87962566103423978
+        nn.init.trunc_normal_(self.patch_embed.weight, std=std, a=-2 * std, b=2 * std)
+        if self.patch_embed.bias is not None:
+            nn.init.zeros_(self.patch_embed.bias)
+        
+        # Initialize dilated convolutions (similar to conv_last in the original code)
+        for m in [self.stage1.conv, self.stage2.conv]:
+            nn.init.normal_(m.weight, mean=0.0, std=math.sqrt(2.0 / m.out_channels))
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        
+        # Initialize batch norm layers
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
         
     def forward(self, x):
-        # x shape: (batch_size, in_channels, 256, 256)
+        # Initial patching: 256 patches of 2x2 resolution
+        #print(x.shape)
+        x = self.patch_embed(x)  # Shape: [B, embed_dim, 16, 16]
+        tokens_stage1 = x.flatten(2).transpose(1, 2)  # Shape: [B, 256, embed_dim]
+        #print(tokens_stage1.shape)
+        # Stage 1: 16 patches with 64x64 receptive field
+        x = self.stage1(x)
+        x = F.avg_pool2d(x, kernel_size=4)  # Shape: [B, embed_dim, 4, 4]
+        tokens_stage2 = x.flatten(2).transpose(1, 2)  # Shape: [B, 16, embed_dim]
+        #print(tokens_stage2.shape)
+        # Stage 2: 1x1 patch with global receptive field
+        x = self.stage2(x)
+        x = F.adaptive_avg_pool2d(x, 1)  # Shape: [B, embed_dim, 1, 1]
+        tokens_stage3 = x.flatten(2).transpose(1, 2)  # Shape: [B, 1, embed_dim]
+        #print(tokens_stage3.shape)
+        # Combine tokens from all stages
+        tokens = torch.cat([tokens_stage1, tokens_stage2, tokens_stage3], dim=1)  # Shape: [B, 273, embed_dim]
         
-        # Process original image
-        x_original = self.projection(x)
-        x_original = x_original.flatten(2).transpose(1, 2)
-        # x_original shape: (batch_size, 256, embed_dim)
-        
-        # Downsample to 64x64
-        x_64 = self.downsample(x)
-        # x_64 shape: (batch_size, in_channels, 64, 64)
-        
-        # Process 64x64 image
-        x_64_patches = self.projection(x_64)
-        x_64_patches = x_64_patches.flatten(2).transpose(1, 2)
-        # x_64_patches shape: (batch_size, 16, embed_dim)
-        
-        # Downsample to 16x16
-        x_16 = self.downsample(x_64)
-        # x_16 shape: (batch_size, in_channels, 16, 16)
-        
-        # Process 16x16 image
-        x_16_patch = self.projection(x_16)
-        x_16_patch = x_16_patch.flatten(2).transpose(1, 2)
-        # x_16_patches shape: (batch_size, 1, embed_dim)
-        
-        # Concatenate all
-        x_combined = torch.cat([x_original, x_64_patches, x_16_patch], dim=1)
-        # x_combined shape: (batch_size, 273, embed_dim)
-        
-        return x_combined
-
+        return tokens
+    
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
 
@@ -288,7 +299,7 @@ class SimpleVisionTransformer(nn.Module):
         self.norm_layer = norm_layer
 
         # Add PatchExtractor
-        self.patch_extractor = PatchExtractor(image_size=image_size, patch_size=patch_size, in_channels=3, embed_dim=hidden_dim)
+        self.patch_extractor = TokenGenerator(image_size=image_size, patch_size=patch_size, in_channels=3, embed_dim=hidden_dim)
         
         # Update seq_length to match the number of tokens from TokenGenerator
         self.seq_length = seq_length
@@ -381,7 +392,7 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [
 #Change_path_for_the_directory;This is the directory where model weights are to be saved
 checkpoint_path = "/kaggle/working/"
 
-def save_checkpoint(state, is_best, path, filename='imagenet_GELU_patchconvcheckpoint.pth.tar'):
+def save_checkpoint(state, is_best, path, filename='imagenet_Dilated_patchconvcheckpoint.pth.tar'):
     filename = os.path.join(path, filename)
     torch.save(state, filename)
     if is_best:
@@ -389,7 +400,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_GELU_patchconvcheck
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'GELU_VIT.pt')
+    filename = os.path.join(checkpoint_path, f'Dilated_VIT.pt')
     
     # Save the checkpoint
     torch.save({
@@ -504,7 +515,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_GELUConv_run")
+wandb.init(project="fractual_transformer", name="ImageNet100_DilatedConv_run")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
