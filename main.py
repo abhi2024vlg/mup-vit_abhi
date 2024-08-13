@@ -143,7 +143,10 @@ class PatchExtractor(nn.Module):
         
         self.projection= nn.Conv2d(in_channels=in_channels, out_channels=embed_dim,kernel_size=patch_size, stride=patch_size, padding=0, bias=False)
         
-        self.downsample = nn.AvgPool2d(kernel_size=4, stride=4, padding=0)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=4, stride=4),
+            nn.GELU(),
+        )
         
         self.embed_dim = embed_dim
         
@@ -378,7 +381,7 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [
 #Change_path_for_the_directory;This is the directory where model weights are to be saved
 checkpoint_path = "/kaggle/working/"
 
-def save_checkpoint(state, is_best, path, filename='imagenet_average_patchconvcheckpoint.pth.tar'):
+def save_checkpoint(state, is_best, path, filename='imagenet_GELU_patchconvcheckpoint.pth.tar'):
     filename = os.path.join(path, filename)
     torch.save(state, filename)
     if is_best:
@@ -386,7 +389,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_average_patchconvch
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'AVG_VIT.pt')
+    filename = os.path.join(checkpoint_path, f'GELU_VIT.pt')
     
     # Save the checkpoint
     torch.save({
@@ -501,7 +504,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_AvgConv_run")
+wandb.init(project="fractual_transformer", name="ImageNet100_GELUConv_run")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
