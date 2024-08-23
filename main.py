@@ -1,4 +1,5 @@
 ### Necessary Imports and dependencies
+### Wandb project_name is ImageNet_Baseline_Conv2D
 import os
 import shutil
 import time
@@ -19,6 +20,8 @@ import wandb
 import json
 from PIL import Image
 from torch.utils.data import Dataset
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 num_epochs=30
 
@@ -128,19 +131,35 @@ val_loader = torch.utils.data.DataLoader(
     drop_last=True
 )
 
-warmup_try=10000
+warmup_try=1000
 
-# Taken from https://github.com/lucidrains/vit-pytorch, likely ported from https://github.com/google-research/big_vision/
 def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
     assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
     omega = torch.arange(dim // 4) / (dim // 4 - 1)
     omega = 1.0 / (temperature ** omega)
-
+    
     y = y.flatten()[:, None] * omega[None, :]
     x = x.flatten()[:, None] * omega[None, :]
     pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
-    return pe.type(dtype)
+    return pe.type(dtype).reshape(h, w, dim)
+
+def generate_combined_posemb(height, total_width, dim):
+    # Generate embeddings for each part
+    pe_256 = posemb_sincos_2d(height, 256, dim).to(device)
+    pe_16 = posemb_sincos_2d(height, 16, dim).to(device)
+    pe_1 = posemb_sincos_2d(height, 1, dim).to(device)
+    
+    # Concatenate along the width dimension
+    combined_pe = torch.cat([pe_256, pe_16, pe_1], dim=1)
+    
+    # Ensure the result matches the expected shape
+    assert combined_pe.shape == (height, total_width, dim), f"Expected shape {(height, total_width, dim)}, got {combined_pe.shape}"
+    
+    combined_pe
+    
+    return combined_pe
+
 
 
 class EncoderBlock(nn.Module):
@@ -220,7 +239,6 @@ class Encoder(nn.Module):
 
 class SimpleVisionTransformer(nn.Module):
     """Vision Transformer modified per https://arxiv.org/abs/2205.01580."""
-
     def __init__(
         self,
         image_size: int,
@@ -250,11 +268,13 @@ class SimpleVisionTransformer(nn.Module):
         self.conv_proj = nn.Conv2d(
             in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
         )
-
-        h = w = image_size // patch_size
-        seq_length = h * w
-        self.register_buffer("pos_embedding", posemb_sincos_2d(h=h, w=w, dim=hidden_dim))
-
+        
+        self.token_conv = nn.Conv2d(
+            in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=4, stride=4
+        )
+        
+        seq_length = 273
+        
         self.encoder = Encoder(
             seq_length,
             num_layers,
@@ -312,24 +332,29 @@ class SimpleVisionTransformer(nn.Module):
 
         # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
         x = self.conv_proj(x)
-        
+        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, n_h / 4, n_w / 4)
+        y = self.token_conv(x)
+        # (n, hidden_dim, n_h / 4, n_w / 4) -> (n, hidden_dim, n_h / 16, n_w / 16)
+        z = self.token_conv(y)
         # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
         x = x.reshape(n, self.hidden_dim, n_h * n_w)
-        
-        
-        
-        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
-        # The self attention layer expects inputs in the format (N, S, E)
-        # where S is the source sequence length, N is the batch size, E is the
-        # embedding dimension
+        # (n, hidden_dim, n_h / 4, n_w / 4) -> (n, hidden_dim, (n_h * n_w) / 16)
+        y = y.reshape(n, self.hidden_dim, n_h // 4 * n_w // 4)
+        # (n, hidden_dim, n_h / 16, n_w / 16) -> (n, hidden_dim, (n_h * n_w) / 256)
+        z = z.reshape(n, self.hidden_dim, n_h // 16 * n_w // 16)
+        x = torch.cat([x, y, z], dim=2)
         x = x.permute(0, 2, 1)
-        
         return x
 
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        x = x + self.pos_embedding
+
+        height, total_width, dim = x.shape
+        positional_embedding = generate_combined_posemb(height, total_width, dim)
+        # Add positional embedding to the input tensor
+        positional_embedding = positional_embedding.to(x.device)
+        x = x + positional_embedding
         x = self.encoder(x)
         x = x.mean(dim = 1)
         x = self.heads(x)
@@ -352,7 +377,7 @@ model = SimpleVisionTransformer(
 )
 
 model = nn.DataParallel(model)
-model.to('cuda')
+model.to(device)
 
 wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
 non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
@@ -378,7 +403,7 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [
 #Change_path_for_the_directory;This is the directory where model weights are to be saved
 checkpoint_path = "/kaggle/working/"
 
-def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvcheckpoint.pth.tar'):
+def save_checkpoint(state, is_best, path, filename='imagenet_new_baseline_patchconvcheckpoint.pth.tar'):
     filename = os.path.join(path, filename)
     torch.save(state, filename)
     if is_best:
@@ -386,7 +411,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'BaseLine_VIT.pt')
+    filename = os.path.join(checkpoint_path, f'New_BaseLine_VIT.pt')
     
     # Save the checkpoint
     torch.save({
@@ -501,7 +526,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_modified_token")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
