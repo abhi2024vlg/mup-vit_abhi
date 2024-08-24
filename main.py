@@ -21,6 +21,8 @@ import json
 from PIL import Image
 from torch.utils.data import Dataset
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 num_epochs=30
 
 # Parameters specific to ImageNet100
@@ -131,17 +133,28 @@ val_loader = torch.utils.data.DataLoader(
 
 warmup_try=1000
 
-# Taken from https://github.com/lucidrains/vit-pytorch, likely ported from https://github.com/google-research/big_vision/
 def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
     assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
     omega = torch.arange(dim // 4) / (dim // 4 - 1)
     omega = 1.0 / (temperature ** omega)
-
+    
     y = y.flatten()[:, None] * omega[None, :]
     x = x.flatten()[:, None] * omega[None, :]
     pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
     return pe.type(dtype)
+
+def generate_combined_posemb(dim):
+    # Generate embeddings for each part
+    pe_256 = posemb_sincos_2d(16,16, dim).to(device)
+    pe_16 = posemb_sincos_2d(4,4, dim).to(device)
+    pe_1 = posemb_sincos_2d(1, 1, dim).to(device)
+    
+    # Concatenate along the width dimension
+    combined_pe = torch.cat([pe_256, pe_16, pe_1], dim=0)
+    
+    return combined_pe
+
 
 
 class EncoderBlock(nn.Module):
@@ -254,11 +267,9 @@ class SimpleVisionTransformer(nn.Module):
         self.token_conv = nn.Conv2d(
             in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=4, stride=4
         )
-
-        h = w = image_size // patch_size
-        seq_length = h * w
-        self.register_buffer("pos_embedding", posemb_sincos_2d(h=h, w=w, dim=hidden_dim))
-
+        
+        seq_length = 273
+        
         self.encoder = Encoder(
             seq_length,
             num_layers,
@@ -270,8 +281,11 @@ class SimpleVisionTransformer(nn.Module):
             norm_layer,
         )
         self.seq_length = seq_length
+        
+        self.register_buffer("pos_embedding", generate_combined_posemb(dim=hidden_dim))
 
         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
+            
         if representation_size is None:
             heads_layers["head"] = nn.Linear(hidden_dim, num_classes)
         else:
@@ -333,6 +347,7 @@ class SimpleVisionTransformer(nn.Module):
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
+        x = x + self.pos_embedding
         x = self.encoder(x)
         x = x.mean(dim = 1)
         x = self.heads(x)
@@ -355,7 +370,7 @@ model = SimpleVisionTransformer(
 )
 
 model = nn.DataParallel(model)
-model.to('cuda')
+model.to(device)
 
 wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
 non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
@@ -381,7 +396,7 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [
 #Change_path_for_the_directory;This is the directory where model weights are to be saved
 checkpoint_path = "/kaggle/working/"
 
-def save_checkpoint(state, is_best, path, filename='imagenet_new_baseline_without_PE_patchconvcheckpoint.pth.tar'):
+def save_checkpoint(state, is_best, path, filename='imagenet_new_baseline_patchconvcheckpoint.pth.tar'):
     filename = os.path.join(path, filename)
     torch.save(state, filename)
     if is_best:
@@ -389,7 +404,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_new_baseline_withou
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'New_BaseLine_without_PE_VIT.pt')
+    filename = os.path.join(checkpoint_path, f'New_BaseLine_VIT.pt')
     
     # Save the checkpoint
     torch.save({
@@ -504,7 +519,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_without_PE_run_modified_token")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_modified_token")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
