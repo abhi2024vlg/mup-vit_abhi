@@ -1,5 +1,5 @@
 ### Necessary Imports and dependencies
-### Wandb project_name is ImageNet_Baseline_Conv2D
+### Wandb project_name is ImageNet100_Baseline_run_more_fractal_PE
 import os
 import shutil
 import time
@@ -153,11 +153,20 @@ def generate_combined_posemb(dim, device):
     return combined_pe
 
 def create_fractal_attention_mask(n_h, n_w):
-    # Create mask for 16x16 grid
-    mask_16x16 = torch.ones(n_h * n_w, n_h * n_w)
+    
+    base_len = n_h * n_w
+    # Create mask for 16x16 grid: Tokens can only attend to their 4x4 patch mates.
+    mask_16x16 = torch.zeros(base_len, base_len)
+    for i in range(n_h // 4):
+        for j in range(n_w // 4):
+            for r1 in range(i * 4, i * 4 + 4):
+                s1 = r1 * n_w + j * 4
+                for r2 in range(i * 4, i * 4 + 4):
+                    s2 = r2 * n_w + j * 4
+                    mask_16x16[s1:s1 + 4, s2:s2 + 4] = 1
     
     # Create mask for 4x4 summary tokens
-    mask_4x4 = torch.ones(n_h * n_w // 16, n_h * n_w // 16)
+    mask_4x4 = torch.ones(base_len // 16, base_len // 16)
     
     # Create mask for global token
     mask_global = torch.ones(1, 1)
@@ -165,15 +174,18 @@ def create_fractal_attention_mask(n_h, n_w):
     # Combine masks
     mask = torch.block_diag(mask_16x16, mask_4x4, mask_global)
     
-    # Allow 4x4 summary tokens to attend to their corresponding 4x4 regions
-    for i in range(n_h * n_w // 16):
-        start_row = i * 16
-        end_row = (i + 1) * 16
-        mask[n_h * n_w + i, start_row:end_row] = 1
+    # Allow 4x4 summary tokens to attend to their corresponding 4x4 regions, and vice versa.
+    for i in range(n_h // 4):
+        for j in range(n_w // 4):
+            index = base_len + i * 4 + j
+            for row in range(i * 4, i * 4 + 4):
+                start = row * n_w + j * 4
+                mask[start:start + 4, index] = mask[index, start:start + 4] = 1
     
-    # Allow global token to attend to everything
-    mask[-1, :] = 1
-    mask[:, -1] = 1
+    # Allow global token to attend to summary tokens, and vice versa.
+    
+    mask[-1, base_len:base_len + base_len // 16] = 1
+    mask[base_len:base_len + base_len // 16, -1] = 1
     
     return mask
 
@@ -557,7 +569,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_more_fractal_PE")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
