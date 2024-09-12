@@ -1,5 +1,5 @@
 ### Necessary Imports and dependencies
-### Wandb project_name is ImageNet_Baseline_Conv2D
+### Wandb project_name is ImageNet100_Baseline_run_more_fractal_without_PE_new
 import os
 import shutil
 import time
@@ -155,8 +155,8 @@ def generate_combined_posemb(dim, device):
 def create_fractal_attention_mask(n_h, n_w):
     
     base_len = n_h * n_w
-    # Create mask for 16x16 grid: Tokens can only attend to their 4x4 patch mates.
-    mask_16x16 = torch.zeros(base_len, base_len)
+    # Create mask for 16x16 grid let all the base tokens attend each other first
+    mask_16x16 = torch.ones(n_h * n_w, n_h * n_w)
     for i in range(n_h // 4):
         for j in range(n_w // 4):
             for r1 in range(i * 4, i * 4 + 4):
@@ -385,7 +385,7 @@ class SimpleVisionTransformer(nn.Module):
         n = x.shape[0]
 
         # Add positional encoding
-#       x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
+#        x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
 
         # Prepare attention mask for the encoder
         attention_mask = self.attention_mask.unsqueeze(0).expand(n, -1, -1)
@@ -569,7 +569,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_more_fractal_without_PE")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_more_fractal_without_PE_new")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
