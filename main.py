@@ -1,5 +1,5 @@
 ### Necessary Imports and dependencies
-### Wandb project_name is ImageNet100_Baseline_run_more_fractal_PE
+### Wandb project_name is ImageNet_Baseline_Conv2D
 import os
 import shutil
 import time
@@ -385,7 +385,7 @@ class SimpleVisionTransformer(nn.Module):
         n = x.shape[0]
 
         # Add positional encoding
-        x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
+#       x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
 
         # Prepare attention mask for the encoder
         attention_mask = self.attention_mask.unsqueeze(0).expand(n, -1, -1)
@@ -569,7 +569,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_more_fractal_PE")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_more_fractal_without_PE")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
