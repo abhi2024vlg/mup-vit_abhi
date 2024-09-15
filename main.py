@@ -1,4 +1,4 @@
-### This is Modified BaseLine
+### This is Modified BaseLine without PE
 
 ### Necessary Imports and dependencies
 import os
@@ -362,7 +362,7 @@ class SimpleVisionTransformer(nn.Module):
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        x = x + self.pos_embedding
+        #No_Positional_embedding
         x = self.encoder(x)
         x = x[:, -1]  # Use the global token for classification
         x = self.heads(x)
@@ -419,7 +419,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'BaseLine_VIT.pt')
+    filename = os.path.join(checkpoint_path, f'(modified)BaseLine_VIT_No_PE.pt')
     
     # Save the checkpoint
     torch.save({
@@ -534,7 +534,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Modified_Baseline_run_PE_1000")
+wandb.init(project="fractual_transformer", name="ImageNet100_Modified_Baseline_run_without_PE_1000")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
