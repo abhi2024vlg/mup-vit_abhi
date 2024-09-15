@@ -1,6 +1,7 @@
-# This is BaseLine VIT with mask attention((incorrect one but showed good accuracy))
+# This is BaseLine VIT with mask attention(correct code)
 
 ### Necessary Imports and dependencies
+
 import os
 import shutil
 import time
@@ -32,8 +33,8 @@ warmup_try=1000
 batch_size = 256
 
 # Dataset loading code
-
 # ImageNet image size (256,256)
+
 class ImageNet100Dataset(Dataset):
     def __init__(self, root_dirs, labels_file, transform=None):
         self.transform = transform
@@ -178,11 +179,13 @@ def create_fractal_attention_mask(n_h, n_w):
     mask = torch.block_diag(mask_16x16, mask_4x4, mask_global)
     
     # Allow 4x4 summary tokens to attend to their corresponding 4x4 regions
-    for i in range(n_h * n_w // 16):
-        start_row = i * 16
-        end_row = (i + 1) * 16
-        mask[n_h * n_w + i, start_row:end_row] = 1
-    
+    for i in range(n_h // 4):
+        for j in range(n_w // 4):
+            index = n_h * n_w + i * 4 + j
+            for row in range(i * 4, i * 4 + 4):
+                start = row * n_w + j * 4
+                mask[index, start:start + 4] = 1
+
     # Allow global token to attend to everything
     mask[-1, :] = 1
     mask[:, -1] = 1
@@ -329,9 +332,9 @@ class SimpleVisionTransformer(nn.Module):
             heads_layers["head"] = nn.Linear(representation_size, num_classes)
 
         self.heads = nn.Sequential(heads_layers)
-        
-        self._init_weights()
 
+        self._init_weights()
+    
     def _init_weights(self):
         # Init the patchify stem
         fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1] // self.conv_proj.groups
@@ -344,7 +347,6 @@ class SimpleVisionTransformer(nn.Module):
         if isinstance(self.heads.head, nn.Linear):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
-
 
     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
         n, c, h, w = x.shape
@@ -444,7 +446,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'BaseLine_mask_attention(incoorect)VIT.pt')
+    filename = os.path.join(checkpoint_path, f'(modified)BaseLine_VIT_mask_attention_PE(correct).pt')
     
     # Save the checkpoint
     torch.save({
@@ -559,7 +561,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_Mask_attention_incorrect_PE_1000run")
+wandb.init(project="fractual_transformer", name="ImageNet100_(modified)Baseline_run_mask_attention_PE_1000")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
