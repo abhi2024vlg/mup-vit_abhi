@@ -172,7 +172,7 @@ def create_fractal_attention_mask(n_h, n_w):
             for row in range(i * 4, i * 4 + 4):
                 start = row * n_w + j * 4
                 mask[index, start:start + 4] = 1
-
+                
     # Allow global token to attend to everything
     mask[-1, :] = 1
     mask[:, -1] = 1
@@ -374,8 +374,8 @@ class SimpleVisionTransformer(nn.Module):
         x = self._process_input(x)
         n = x.shape[0]
 
-#         # Add positional encoding
-#         x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
+        # Add positional encoding
+        x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
 
         # Prepare attention mask for the encoder
         attention_mask = self.attention_mask.unsqueeze(0).expand(n, -1, -1)
@@ -559,7 +559,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_with_mask_attention_no_PE")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
