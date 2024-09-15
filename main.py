@@ -1,4 +1,4 @@
-# This is BaseLine VIT with mask attention(correct code)
+#This is BaseLine_VIT_more_fractal
 
 ### Necessary Imports and dependencies
 
@@ -135,6 +135,7 @@ val_loader = torch.utils.data.DataLoader(
     drop_last=True
 )
 
+
 def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
     assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
@@ -166,11 +167,20 @@ def jax_lecun_normal(layer, fan_in):
         nn.init.zeros_(layer.bias)
         
 def create_fractal_attention_mask(n_h, n_w):
-    # Create mask for 16x16 grid
-    mask_16x16 = torch.ones(n_h * n_w, n_h * n_w)
+    
+    base_len = n_h * n_w
+    # Create mask for 16x16 grid: Tokens can only attend to their 4x4 patch mates.
+    mask_16x16 = torch.zeros(base_len, base_len)
+    for i in range(n_h // 4):
+        for j in range(n_w // 4):
+            for r1 in range(i * 4, i * 4 + 4):
+                s1 = r1 * n_w + j * 4
+                for r2 in range(i * 4, i * 4 + 4):
+                    s2 = r2 * n_w + j * 4
+                    mask_16x16[s1:s1 + 4, s2:s2 + 4] = 1
     
     # Create mask for 4x4 summary tokens
-    mask_4x4 = torch.ones(n_h * n_w // 16, n_h * n_w // 16)
+    mask_4x4 = torch.ones(base_len // 16, base_len // 16)
     
     # Create mask for global token
     mask_global = torch.ones(1, 1)
@@ -178,17 +188,18 @@ def create_fractal_attention_mask(n_h, n_w):
     # Combine masks
     mask = torch.block_diag(mask_16x16, mask_4x4, mask_global)
     
-    # Allow 4x4 summary tokens to attend to their corresponding 4x4 regions
+    # Allow 4x4 summary tokens to attend to their corresponding 4x4 regions, and vice versa.
     for i in range(n_h // 4):
         for j in range(n_w // 4):
-            index = n_h * n_w + i * 4 + j
+            index = base_len + i * 4 + j
             for row in range(i * 4, i * 4 + 4):
                 start = row * n_w + j * 4
-                mask[index, start:start + 4] = 1
-
-    # Allow global token to attend to everything
-    mask[-1, :] = 1
-    mask[:, -1] = 1
+                mask[start:start + 4, index] = mask[index, start:start + 4] = 1
+    
+    # Allow global token to attend to summary tokens, and vice versa.
+    
+    mask[-1, base_len:base_len + base_len // 16] = 1
+    mask[base_len:base_len + base_len // 16, -1] = 1
     
     return mask
 
@@ -334,7 +345,7 @@ class SimpleVisionTransformer(nn.Module):
         self.heads = nn.Sequential(heads_layers)
 
         self._init_weights()
-    
+
     def _init_weights(self):
         # Init the patchify stem
         fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1] // self.conv_proj.groups
@@ -446,7 +457,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'(modified)BaseLine_VIT_mask_attention_PE(correct).pt')
+    filename = os.path.join(checkpoint_path, f'(Modified)BaseLine_VIT_more_fractal.pt')
     
     # Save the checkpoint
     torch.save({
@@ -561,7 +572,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_(modified)Baseline_run_mask_attention_PE_1000")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline(modified)_run_more_fractal_PE_1000")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
