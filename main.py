@@ -1,4 +1,4 @@
-#This is BaseLine_VIT_more_fractal
+#This is BaseLine_VIT_more_fractal_changed(revert ⁠ mask_16x16 ⁠ and let all the base tokens attend each other first)
 
 ### Necessary Imports and dependencies
 
@@ -169,8 +169,10 @@ def jax_lecun_normal(layer, fan_in):
 def create_fractal_attention_mask(n_h, n_w):
     
     base_len = n_h * n_w
-    # Create mask for 16x16 grid: Tokens can only attend to their 4x4 patch mates.
-    mask_16x16 = torch.zeros(base_len, base_len)
+    
+    # Create mask for 16x16 grid
+    
+    mask_16x16 = torch.ones(base_len,base_len)
     for i in range(n_h // 4):
         for j in range(n_w // 4):
             for r1 in range(i * 4, i * 4 + 4):
@@ -457,7 +459,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'(Modified)BaseLine_VIT_more_fractal.pt')
+    filename = os.path.join(checkpoint_path, f'(Modified)BaseLine_VIT_more_fractal_changed.pt')
     
     # Save the checkpoint
     torch.save({
@@ -572,7 +574,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline(modified)_run_more_fractal_PE_1000")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline(modified)_run_more_fractal_changedPE_1000")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
