@@ -1,5 +1,6 @@
+### This is⁠ Modified BaseLine with 17 registers ,positional embedding ⁠ but with the old initialization
+
 ### Necessary Imports and dependencies
-### Wandb project_name is ImageNet_Baseline_Conv2D
 import os
 import shutil
 import time
@@ -21,7 +22,11 @@ import json
 from PIL import Image
 from torch.utils.data import Dataset
 
+#No. of Epochs
 num_epochs=30
+
+#Warmp_Steps
+warmup_try=10000
 
 # Parameters specific to ImageNet100
 batch_size = 256
@@ -129,8 +134,8 @@ val_loader = torch.utils.data.DataLoader(
     drop_last=True
 )
 
-warmup_try=10000
 
+# Taken from https://github.com/lucidrains/vit-pytorch, likely ported from https://github.com/google-research/big_vision/
 def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
     assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
@@ -152,51 +157,9 @@ def generate_combined_posemb(dim, device):
     combined_pe = torch.cat([pe_256, pe_16, pe_1], dim=0)
     return combined_pe
 
-def create_fractal_attention_mask(n_h, n_w):
-    # Create mask for 16x16 grid
-    mask_16x16 = torch.ones(n_h * n_w, n_h * n_w)
-    
-    # Create mask for 4x4 summary tokens
-    mask_4x4 = torch.ones(n_h * n_w // 16, n_h * n_w // 16)
-    
-    # Create mask for global token
-    mask_global = torch.ones(1, 1)
-    
-    # Combine masks
-    mask = torch.block_diag(mask_16x16, mask_4x4, mask_global)
-    
-    # Allow 4x4 summary tokens to attend to their corresponding 4x4 regions
-    for i in range(n_h // 4):
-        for j in range(n_w // 4):
-            index = n_h * n_w + i * 4 + j
-            for row in range(i * 4, i * 4 + 4):
-                start = row * n_w + j * 4
-                mask[index, start:start + 4] = 1
-                
-    # Allow global token to attend to everything
-    mask[-1, :] = 1
-    mask[:, -1] = 1
-    
-    return mask
-
-class MLPBlock(nn.Module):
-    def __init__(self, in_dim, mlp_dim, dropout):
-        super().__init__()
-        self.linear_1 = nn.Linear(in_dim, mlp_dim)
-        self.activation = nn.GELU()
-        self.dropout_1 = nn.Dropout(dropout)
-        self.linear_2 = nn.Linear(mlp_dim, in_dim)
-        self.dropout_2 = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.linear_1(x)
-        x = self.activation(x)
-        x = self.dropout_1(x)
-        x = self.linear_2(x)
-        x = self.dropout_2(x)
-        return x
-
 class EncoderBlock(nn.Module):
+    """Transformer encoder block."""
+
     def __init__(
         self,
         num_heads: int,
@@ -218,12 +181,10 @@ class EncoderBlock(nn.Module):
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.ln_1(input)
-        
-        # Apply self-attention with fractal attention masking
-        x, _ = self.self_attention(x, x, x, attn_mask=attention_mask, need_weights=False)
+        x, _ = self.self_attention(x, x, x, need_weights=False)
         x = self.dropout(x)
         x = x + input
 
@@ -231,7 +192,10 @@ class EncoderBlock(nn.Module):
         y = self.mlp(y)
         return x + y
 
+
 class Encoder(nn.Module):
+    """Transformer Model Encoder for sequence to sequence translation."""
+
     def __init__(
         self,
         seq_length: int,
@@ -258,14 +222,14 @@ class Encoder(nn.Module):
         self.layers = nn.Sequential(layers)
         self.ln = norm_layer(hidden_dim)
 
-    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
-        x = self.dropout(input)
-        for layer in self.layers:
-            x = layer(x, attention_mask)
-        return self.ln(x)
+        return self.ln(self.layers(self.dropout(input)))
+
 
 class SimpleVisionTransformer(nn.Module):
+    """Vision Transformer modified per https://arxiv.org/abs/2205.01580."""
+
     def __init__(
         self,
         image_size: int,
@@ -279,6 +243,8 @@ class SimpleVisionTransformer(nn.Module):
         num_classes: int = 100,
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        num_summary_token: int = 16, # Added parameter for number of summary token 
+        num_global_token: int = 1 # Added parameter for number of global token
     ):
         super().__init__()
         torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
@@ -291,22 +257,20 @@ class SimpleVisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.representation_size = representation_size
         self.norm_layer = norm_layer
-        self.num_heads = num_heads
-
+        self.num_summary_token = num_summary_token
+        self.num_global_token = num_global_token
         self.conv_proj = nn.Conv2d(
             in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
         )
 
-        grid_size = image_size // patch_size
-        self.grid_size = grid_size
-        seq_length = grid_size * grid_size + grid_size * grid_size // 16 + 1  # Image patches + summary tokens + global token
-        self.seq_length = seq_length
-
-        # Initialize position embeddings
-        self.register_buffer("pos_embedding", generate_combined_posemb(hidden_dim, self.conv_proj.weight.device))
-
-        # Create fractal attention mask
-        self.register_buffer("attention_mask", create_fractal_attention_mask(grid_size, grid_size))
+        h = w = image_size // patch_size
+        seq_length = h * w + 16 +1 # Adding registers and global token (16 +1 registers with the last one as global token as well)
+        
+        #Generate register and combined positional embedding
+        
+        combined_pe = generate_combined_posemb(hidden_dim,device = device)
+        
+        self.register_buffer("pos_embedding",combined_pe )
 
         self.encoder = Encoder(
             seq_length,
@@ -318,6 +282,7 @@ class SimpleVisionTransformer(nn.Module):
             attention_dropout,
             norm_layer,
         )
+        self.seq_length = seq_length
 
         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
         if representation_size is None:
@@ -345,51 +310,50 @@ class SimpleVisionTransformer(nn.Module):
         if isinstance(self.heads.head, nn.Linear):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
-
+            
     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
         n, c, h, w = x.shape
         p = self.patch_size
+        
         torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
         torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        
+        n_h = h // p
+        n_w = w // p
 
-        # (n, c, h, w) -> (n, hidden_dim, grid_size, grid_size)
+        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
         x = self.conv_proj(x)
         
-        # (n, hidden_dim, grid_size, grid_size) -> (n, grid_size * grid_size, hidden_dim)
-        x = x.flatten(2).transpose(1, 2)
+        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
+        x = x.reshape(n, self.hidden_dim, n_h * n_w)
         
-        # Add summary tokens (zero-initialized)
-        summary_tokens = torch.zeros((n, self.grid_size * self.grid_size // 16, self.hidden_dim), device=x.device)
         
-        # Add global token (zero-initialized)
-        global_token = torch.zeros((n, 1, self.hidden_dim), device=x.device)
+        
+        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+        # The self attention layer expects inputs in the format (N, S, E)
+        # where S is the source sequence length, N is the batch size, E is the
+        # embedding dimension
+        
+        x = x.permute(0, 2, 1)
+        
+        # Add summary tokens (equivalent to registers)
+        
+        summary_tokens = torch.zeros((n, self.num_summary_token, self.hidden_dim), device=x.device)
+        
+        # Add global token
+        global_token = torch.zeros((n, self.num_global_token, self.hidden_dim), device=x.device)
         
         # Combine all tokens
         x = torch.cat([x, summary_tokens, global_token], dim=1)
-
+        
         return x
 
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        n = x.shape[0]
-
-        # Add positional encoding
-        x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
-
-        # Prepare attention mask for the encoder
-        attention_mask = self.attention_mask.unsqueeze(0).expand(n, -1, -1)
-        attention_mask = attention_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-        attention_mask = attention_mask.reshape(n * self.num_heads, self.seq_length, self.seq_length)
-        attention_mask = attention_mask.masked_fill(attention_mask == 0, float('-inf'))
-
-        # Apply transformer
-        x = self.encoder(x, attention_mask=attention_mask)
-        
-        # Use the global token for classification
-        x = x[:, -1]
-
-        # Apply classification head
+        x = x + self.pos_embedding
+        x = self.encoder(x)
+        x = x[:, -1]  # Use the global token for classification
         x = self.heads(x)
 
         return x
@@ -444,7 +408,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'BaseLine_VIT.pt')
+    filename = os.path.join(checkpoint_path, f'BaseLine_VIT_old_init.pt')
     
     # Save the checkpoint
     torch.save({
@@ -559,7 +523,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run")
+wandb.init(project="fractual_transformer", name="ImageNet100_Modified_Baseline_run_PE_10000_old_init.")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
