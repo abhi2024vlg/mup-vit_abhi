@@ -265,7 +265,7 @@ class SimpleVisionTransformer(nn.Module):
         padding_size: int = 16  # New parameter for padding size
     ):
         super().__init__()
-#       torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
+        torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
 
         self.image_size = image_size
         self.patch_size = patch_size
@@ -283,8 +283,7 @@ class SimpleVisionTransformer(nn.Module):
             in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
         )
         
-        padded_image_size = image_size + 2 * padding_size
-        h = w = padded_image_size // patch_size
+        h = w = image_size // patch_size
         seq_length = h * w + num_summary_token + num_global_token # Adding registers and global token (16 +1 registers with the last one as global token as well)
         
         #Generate register and combined positional embedding
@@ -338,15 +337,18 @@ class SimpleVisionTransformer(nn.Module):
 
         torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
         torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
-
+        
+        # Resize the input tensor
+        x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        
         # Add padding to input
         x = F.pad(x, (self.padding_size, self.padding_size, self.padding_size, self.padding_size), mode='constant', value=0)
 
         # Adjust n_h and n_w for padded input
-        n_h = (h + 2 * self.padding_size) // p
-        n_w = (w + 2 * self.padding_size) // p
+        n_h = h // p
+        n_w = w // p
 
-        # (n, c, h+2*padding, w+2*padding) -> (n, hidden_dim, n_h, n_w)
+        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
         x = self.conv_proj(x)
 
         # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
@@ -369,7 +371,7 @@ class SimpleVisionTransformer(nn.Module):
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        # No Positional embedding
+        x = x + self.pos_embedding
         x = self.encoder(x)
         x = x[:, -1]  # Use the global token for classification
         x = self.heads(x)
@@ -384,7 +386,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # create model
 model = SimpleVisionTransformer(
     image_size=256,
-    patch_size=18,
+    patch_size=16,
     num_layers=12,
     num_heads=6,
     hidden_dim=384,
@@ -542,7 +544,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="Putting the entire image in a big frame without PE")
+wandb.init(project="fractual_transformer", name="Modified putting the entire image in a big frame with PE")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
