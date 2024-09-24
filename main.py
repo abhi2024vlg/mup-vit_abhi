@@ -387,7 +387,7 @@ class SimpleVisionTransformer(nn.Module):
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        x = x + self.pos_embedding
+        #No Positional embedding
         x = self.encoder(x)
         x = x[:, -1]  # Use the global token for classification
         x = self.heads(x)
