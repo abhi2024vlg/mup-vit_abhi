@@ -1,4 +1,4 @@
-#This is BaseLine_VIT_modified_fractal_new_init
+#This is BaseLine_VIT_modified_fractal_old_init
 
 ### Necessary Imports and dependencies
 
@@ -157,14 +157,6 @@ def generate_combined_posemb(dim, device):
     combined_pe = torch.cat([pe_256, pe_16, pe_1], dim=0)
     return combined_pe
 
-def jax_lecun_normal(layer, fan_in):
-    """(re-)initializes layer weight in the same way as jax.nn.initializers.lecun_normal and bias to zero"""
-
-    # constant is stddev of standard normal truncated to (-2, 2)
-    std = math.sqrt(1 / fan_in) / .87962566103423978
-    nn.init.trunc_normal_(layer.weight, std=std, a=-2 * std, b=2 * std)
-    if layer.bias is not None:
-        nn.init.zeros_(layer.bias)
         
 def create_fractal_attention_mask(n_h, n_w):
     # Create mask for 16x16 grid
@@ -193,6 +185,23 @@ def create_fractal_attention_mask(n_h, n_w):
 
     return mask
 
+class MLPBlock(nn.Module):
+    def __init__(self, in_dim, mlp_dim, dropout):
+        super().__init__()
+        self.linear_1 = nn.Linear(in_dim, mlp_dim)
+        self.activation = nn.GELU()
+        self.dropout_1 = nn.Dropout(dropout)
+        self.linear_2 = nn.Linear(mlp_dim, in_dim)
+        self.dropout_2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.linear_1(x)
+        x = self.activation(x)
+        x = self.dropout_1(x)
+        x = self.linear_2(x)
+        x = self.dropout_2(x)
+        return x
+
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
 
@@ -216,12 +225,6 @@ class EncoderBlock(nn.Module):
         # MLP block
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
-
-        # Initialize attention layers
-        # Fix init discrepancy between nn.MultiheadAttention and that of big_vision
-        bound = math.sqrt(3 / hidden_dim)
-        nn.init.uniform_(self.self_attention.in_proj_weight, -bound, bound)
-        nn.init.uniform_(self.self_attention.out_proj.weight, -bound, bound)
 
     def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
@@ -337,14 +340,16 @@ class SimpleVisionTransformer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Init the patchify stem
-        fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1] // self.conv_proj.groups
-        jax_lecun_normal(self.conv_proj, fan_in)
-        
+        # Initialize conv_proj
+        nn.init.normal_(self.conv_proj.weight, std=math.sqrt(2.0 / self.conv_proj.out_channels))
+        if self.conv_proj.bias is not None:
+            nn.init.zeros_(self.conv_proj.bias)
+
+        # Initialize heads
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
-            fan_in = self.heads.pre_logits.in_features
-            jax_lecun_normal(self.heads.pre_logits, fan_in)
-            
+            nn.init.normal_(self.heads.pre_logits.weight, std=math.sqrt(2.0 / self.heads.pre_logits.in_features))
+            nn.init.zeros_(self.heads.pre_logits.bias)
+
         if isinstance(self.heads.head, nn.Linear):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
@@ -447,7 +452,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'BaseLine_VIT_modified_fractal.pt')
+    filename = os.path.join(checkpoint_path, f'BaseLine_VIT_modified_fractal_old.pt')
     
     # Save the checkpoint
     torch.save({
@@ -562,7 +567,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_modified_fractal_10000_new_init")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_modified_fractal_10000_old_init")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
