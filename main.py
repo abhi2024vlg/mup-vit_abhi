@@ -1,6 +1,7 @@
-### This is⁠ Modified BaseLine with 17 registers ,positional embedding ⁠ but with the old initialization
+### This is New_ViT
 
 ### Necessary Imports and dependencies
+!pip install einops
 import os
 import shutil
 import time
@@ -8,6 +9,7 @@ import math
 from enum import Enum
 from functools import partial
 from collections import OrderedDict
+from einops import rearrange
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -157,6 +159,24 @@ def generate_combined_posemb(dim, device):
     combined_pe = torch.cat([pe_256, pe_16, pe_1], dim=0)
     return combined_pe
 
+class MLPBlock(nn.Module):
+    def __init__(self, in_dim, mlp_dim, dropout):
+        super().__init__()
+        self.linear_1 = nn.Linear(in_dim, mlp_dim)
+        self.activation = nn.GELU()
+        self.dropout_1 = nn.Dropout(dropout)
+        self.linear_2 = nn.Linear(mlp_dim, in_dim)
+        self.dropout_2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.linear_1(x)
+        x = self.activation(x)
+        x = self.dropout_1(x)
+        x = self.linear_2(x)
+        x = self.dropout_2(x)
+        return x
+
+
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
 
@@ -225,15 +245,15 @@ class Encoder(nn.Module):
     def forward(self, input: torch.Tensor):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         return self.ln(self.layers(self.dropout(input)))
-
-
+    
 class SimpleVisionTransformer(nn.Module):
     """Vision Transformer modified per https://arxiv.org/abs/2205.01580."""
-
+    
     def __init__(
         self,
         image_size: int,
         patch_size: int,
+        frame_size: int,
         num_layers: int,
         num_heads: int,
         hidden_dim: int,
@@ -250,6 +270,8 @@ class SimpleVisionTransformer(nn.Module):
         torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
         self.image_size = image_size
         self.patch_size = patch_size
+        self.frame_size = frame_size
+        self.framed_patch_size = patch_size + 2 * frame_size
         self.hidden_dim = hidden_dim
         self.mlp_dim = mlp_dim
         self.attention_dropout = attention_dropout
@@ -259,9 +281,7 @@ class SimpleVisionTransformer(nn.Module):
         self.norm_layer = norm_layer
         self.num_summary_token = num_summary_token
         self.num_global_token = num_global_token
-        self.conv_proj = nn.Conv2d(
-            in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
-        )
+        self.conv_proj = nn.Conv2d(in_channels=3,out_channels = self.hidden_dim,kernel_size=self.framed_patch_size, stride=self.patch_size)
 
         h = w = image_size // patch_size
         seq_length = h * w + 16 +1 # Adding registers and global token (16 +1 registers with the last one as global token as well)
@@ -310,34 +330,50 @@ class SimpleVisionTransformer(nn.Module):
         if isinstance(self.heads.head, nn.Linear):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
-            
+       
     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
+        
+        # Input shape: (batch_size, in_channels, image_size, image_size)
+        
         n, c, h, w = x.shape
         p = self.patch_size
         
+        # Ensure input image dimensions match the expected image size
         torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
         torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
         
+        # Calculate the number of patches in height and width
         n_h = h // p
         n_w = w // p
-
-        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
+        
+        # Unfold the image into patches
+        # This creates a 6D tensor: (batch, channels, h_patches, w_patches, patch_height, patch_width)
+        x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+       
+        # Reshape to (batch, channels, num_patches, patch_height, patch_width)
+        x = x.contiguous().view(n, c, -1, self.patch_size, self.patch_size)
+        
+        # Permute to (batch, num_patches, channels, patch_height, patch_width)
+        x = x.permute(0, 2, 1, 3, 4)
+        
+        # Add frame to each patch
+        # This increases the patch size by 2*frame_size in both height and width
+        x = F.pad(x, (self.frame_size, self.frame_size, self.frame_size, self.frame_size), mode='constant', value=0)
+        
+        # Reshape for projection
+        # Combine batch and num_patches dimensions, and use the framed patch size
+        x = x.view(n * n_h * n_w, c, self.framed_patch_size, self.framed_patch_size)
+        
+        # Project the framed patches using a convolutional layer
         x = self.conv_proj(x)
         
-        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
+        # Reshape to (batch, hidden_dim, num_patches)
         x = x.reshape(n, self.hidden_dim, n_h * n_w)
         
-        
-        
-        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
-        # The self attention layer expects inputs in the format (N, S, E)
-        # where S is the source sequence length, N is the batch size, E is the
-        # embedding dimension
-        
+        # Permute to (batch, num_patches, hidden_dim)
         x = x.permute(0, 2, 1)
-        
+       
         # Add summary tokens (equivalent to registers)
-        
         summary_tokens = torch.zeros((n, self.num_summary_token, self.hidden_dim), device=x.device)
         
         # Add global token
@@ -355,7 +391,6 @@ class SimpleVisionTransformer(nn.Module):
         x = self.encoder(x)
         x = x[:, -1]  # Use the global token for classification
         x = self.heads(x)
-
         return x
     
 def weight_decay_param(n, p):
@@ -367,6 +402,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model = SimpleVisionTransformer(
     image_size=256,
     patch_size=16,
+    frame_size = 2,
     num_layers=12,
     num_heads=6,
     hidden_dim=384,
@@ -408,7 +444,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'BaseLine_VIT_old_init.pt')
+    filename = os.path.join(checkpoint_path, f'New_VIT.pt')
     
     # Save the checkpoint
     torch.save({
@@ -476,6 +512,7 @@ class AverageMeter(object):
             raise ValueError('invalid summary type %r' % self.summary_type)
         
         return fmtstr.format(**self.__dict__)
+    
 class ProgressMeter(object):
     def __init__(self, num_batches, meters, prefix=""):
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
@@ -523,7 +560,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Modified_Baseline_run_PE_10000_old_init.")
+wandb.init(project="fractual_transformer", name="ImageNet100_New_ViT_run_PE_10000,frame_size=2")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
