@@ -1,4 +1,4 @@
-### This is experimental_ViT_putting the entire image in a big frame
+### This is experimental_ViT_putting the entire image in a big frame(modified)
 
 ### Necessary Imports and dependencies
 import os
@@ -371,7 +371,7 @@ class SimpleVisionTransformer(nn.Module):
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        x = x + self.pos_embedding
+        # No Positional embedding 
         x = self.encoder(x)
         x = x[:, -1]  # Use the global token for classification
         x = self.heads(x)
@@ -544,7 +544,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="Modified putting the entire image in a big frame with PE")
+wandb.init(project="fractual_transformer", name="Modified putting the entire image in a big frame without PE")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
