@@ -1,6 +1,7 @@
-### This is experimental_ViT_putting the entire image in a big frame(modified)
+#This is BaseLine_VIT_modified_fractal_new_init
 
 ### Necessary Imports and dependencies
+
 import os
 import shutil
 import time
@@ -135,7 +136,6 @@ val_loader = torch.utils.data.DataLoader(
 )
 
 
-# Taken from https://github.com/lucidrains/vit-pytorch, likely ported from https://github.com/google-research/big_vision/
 def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
     y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
     assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
@@ -157,23 +157,42 @@ def generate_combined_posemb(dim, device):
     combined_pe = torch.cat([pe_256, pe_16, pe_1], dim=0)
     return combined_pe
 
-class MLPBlock(nn.Module):
-    def __init__(self, in_dim, mlp_dim, dropout):
-        super().__init__()
-        self.linear_1 = nn.Linear(in_dim, mlp_dim)
-        self.activation = nn.GELU()
-        self.dropout_1 = nn.Dropout(dropout)
-        self.linear_2 = nn.Linear(mlp_dim, in_dim)
-        self.dropout_2 = nn.Dropout(dropout)
+def jax_lecun_normal(layer, fan_in):
+    """(re-)initializes layer weight in the same way as jax.nn.initializers.lecun_normal and bias to zero"""
 
-    def forward(self, x):
-        x = self.linear_1(x)
-        x = self.activation(x)
-        x = self.dropout_1(x)
-        x = self.linear_2(x)
-        x = self.dropout_2(x)
-        return x
+    # constant is stddev of standard normal truncated to (-2, 2)
+    std = math.sqrt(1 / fan_in) / .87962566103423978
+    nn.init.trunc_normal_(layer.weight, std=std, a=-2 * std, b=2 * std)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+        
+def create_fractal_attention_mask(n_h, n_w):
+    # Create mask for 16x16 grid
+    mask_16x16 = torch.ones(n_h * n_w, n_h * n_w)
     
+    # Create mask for 4x4 summary tokens
+    mask_4x4 = torch.ones(n_h * n_w // 16, n_h * n_w // 16)
+    
+    # Create mask for global token
+    mask_global = torch.ones(1, 1)
+    
+    # Combine masks
+    mask = torch.block_diag(mask_16x16, mask_4x4, mask_global)
+
+    # Allow 4x4 summary tokens to attend to their corresponding 4x4 regions and vice versa
+    for i in range(n_h // 4):
+        for j in range(n_w // 4):
+            index = n_h * n_w + i * 4 + j
+            for row in range(i * 4, i * 4 + 4):
+                start = row * n_w + j * 4
+                mask[start:start + 4, index] = mask[index, start:start + 4] = 1
+
+    # Allow global token to attend to everything
+    mask[-1, :] = 1
+    mask[:, -1] = 1
+
+    return mask
+
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
 
@@ -198,10 +217,18 @@ class EncoderBlock(nn.Module):
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor):
+        # Initialize attention layers
+        # Fix init discrepancy between nn.MultiheadAttention and that of big_vision
+        bound = math.sqrt(3 / hidden_dim)
+        nn.init.uniform_(self.self_attention.in_proj_weight, -bound, bound)
+        nn.init.uniform_(self.self_attention.out_proj.weight, -bound, bound)
+
+    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.ln_1(input)
-        x, _ = self.self_attention(x, x, x, need_weights=False)
+        
+        # Apply self-attention with fractal attention masking
+        x, _ = self.self_attention(x, x, x, attn_mask=attention_mask, need_weights=False)
         x = self.dropout(x)
         x = x + input
 
@@ -209,10 +236,7 @@ class EncoderBlock(nn.Module):
         y = self.mlp(y)
         return x + y
 
-
 class Encoder(nn.Module):
-    """Transformer Model Encoder for sequence to sequence translation."""
-
     def __init__(
         self,
         seq_length: int,
@@ -239,14 +263,14 @@ class Encoder(nn.Module):
         self.layers = nn.Sequential(layers)
         self.ln = norm_layer(hidden_dim)
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
-        return self.ln(self.layers(self.dropout(input)))       
+        x = self.dropout(input)
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+        return self.ln(x)
 
-    
 class SimpleVisionTransformer(nn.Module):
-    """Vision Transformer modified per https://arxiv.org/abs/2205.01580."""
-
     def __init__(
         self,
         image_size: int,
@@ -260,16 +284,11 @@ class SimpleVisionTransformer(nn.Module):
         num_classes: int = 100,
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-        num_summary_token: int = 16, # Added parameter for number of summary token 
-        num_global_token: int = 1, # Added parameter for number of global token
-        padding_size: int = 16  # New parameter for padding size
     ):
         super().__init__()
         torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
-
         self.image_size = image_size
         self.patch_size = patch_size
-        self.padding_size = padding_size
         self.hidden_dim = hidden_dim
         self.mlp_dim = mlp_dim
         self.attention_dropout = attention_dropout
@@ -277,20 +296,22 @@ class SimpleVisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.representation_size = representation_size
         self.norm_layer = norm_layer
-        self.num_summary_token = num_summary_token
-        self.num_global_token = num_global_token
+        self.num_heads = num_heads
+
         self.conv_proj = nn.Conv2d(
             in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
         )
-        
-        h = w = image_size // patch_size
-        seq_length = h * w + num_summary_token + num_global_token # Adding registers and global token (16 +1 registers with the last one as global token as well)
-        
-        #Generate register and combined positional embedding
-        
-        combined_pe = generate_combined_posemb(hidden_dim,device = device)
-        
-        self.register_buffer("pos_embedding",combined_pe )
+
+        grid_size = image_size // patch_size
+        self.grid_size = grid_size
+        seq_length = grid_size * grid_size + grid_size * grid_size // 16 + 1  # Image patches + summary tokens + global token
+        self.seq_length = seq_length
+
+        # Initialize position embeddings
+        self.register_buffer("pos_embedding", generate_combined_posemb(hidden_dim, self.conv_proj.weight.device))
+
+        # Create fractal attention mask
+        self.register_buffer("attention_mask", create_fractal_attention_mask(grid_size, grid_size))
 
         self.encoder = Encoder(
             seq_length,
@@ -302,7 +323,6 @@ class SimpleVisionTransformer(nn.Module):
             attention_dropout,
             norm_layer,
         )
-        self.seq_length = seq_length
 
         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
         if representation_size is None:
@@ -317,63 +337,62 @@ class SimpleVisionTransformer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize conv_proj
-        nn.init.normal_(self.conv_proj.weight, std=math.sqrt(2.0 / self.conv_proj.out_channels))
-        if self.conv_proj.bias is not None:
-            nn.init.zeros_(self.conv_proj.bias)
-
-        # Initialize heads
+        # Init the patchify stem
+        fan_in = self.conv_proj.in_channels * self.conv_proj.kernel_size[0] * self.conv_proj.kernel_size[1] // self.conv_proj.groups
+        jax_lecun_normal(self.conv_proj, fan_in)
+        
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
-            nn.init.normal_(self.heads.pre_logits.weight, std=math.sqrt(2.0 / self.heads.pre_logits.in_features))
-            nn.init.zeros_(self.heads.pre_logits.bias)
-
+            fan_in = self.heads.pre_logits.in_features
+            jax_lecun_normal(self.heads.pre_logits, fan_in)
+            
         if isinstance(self.heads.head, nn.Linear):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
-            
+
     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
         n, c, h, w = x.shape
         p = self.patch_size
-
         torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
         torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
-        
-        # Resize the input tensor
-        x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
-        
-        # Add padding to input
-        x = F.pad(x, (self.padding_size, self.padding_size, self.padding_size, self.padding_size), mode='constant', value=0)
 
-        # Adjust n_h and n_w for padded input
-        n_h = h // p
-        n_w = w // p
-
-        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
+        # (n, c, h, w) -> (n, hidden_dim, grid_size, grid_size)
         x = self.conv_proj(x)
-
-        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
-        x = x.reshape(n, self.hidden_dim, n_h * n_w)
-
-        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
-        x = x.permute(0, 2, 1)
-
-        # Add summary tokens (equivalent to registers)
-        summary_tokens = torch.zeros((n, self.num_summary_token, self.hidden_dim), device=x.device)
-
-        # Add global token
-        global_token = torch.zeros((n, self.num_global_token, self.hidden_dim), device=x.device)
-
+        
+        # (n, hidden_dim, grid_size, grid_size) -> (n, grid_size * grid_size, hidden_dim)
+        x = x.flatten(2).transpose(1, 2)
+        
+        # Add summary tokens (zero-initialized)
+        summary_tokens = torch.zeros((n, self.grid_size * self.grid_size // 16, self.hidden_dim), device=x.device)
+        
+        # Add global token (zero-initialized)
+        global_token = torch.zeros((n, 1, self.hidden_dim), device=x.device)
+        
         # Combine all tokens
         x = torch.cat([x, summary_tokens, global_token], dim=1)
 
         return x
-            
+
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        # No Positional embedding 
-        x = self.encoder(x)
-        x = x[:, -1]  # Use the global token for classification
+        n = x.shape[0]
+
+        # Add positional encoding
+        x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
+
+        # Prepare attention mask for the encoder
+        attention_mask = self.attention_mask.unsqueeze(0).expand(n, -1, -1)
+        attention_mask = attention_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        attention_mask = attention_mask.reshape(n * self.num_heads, self.seq_length, self.seq_length)
+        attention_mask = attention_mask.masked_fill(attention_mask == 0, float('-inf'))
+
+        # Apply transformer
+        x = self.encoder(x, attention_mask=attention_mask)
+        
+        # Use the global token for classification
+        x = x[:, -1]
+
+        # Apply classification head
         x = self.heads(x)
 
         return x
@@ -392,7 +411,7 @@ model = SimpleVisionTransformer(
     hidden_dim=384,
     mlp_dim=1536,
 )
-            
+
 model = nn.DataParallel(model)
 model.to('cuda')
 
@@ -428,7 +447,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'Experimental_VIT.pt')
+    filename = os.path.join(checkpoint_path, f'BaseLine_VIT_modified_fractal.pt')
     
     # Save the checkpoint
     torch.save({
@@ -496,7 +515,6 @@ class AverageMeter(object):
             raise ValueError('invalid summary type %r' % self.summary_type)
         
         return fmtstr.format(**self.__dict__)
-    
 class ProgressMeter(object):
     def __init__(self, num_batches, meters, prefix=""):
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
@@ -544,7 +562,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="Modified putting the entire image in a big frame without PE")
+wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_modified_fractal_10000_new_init")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
