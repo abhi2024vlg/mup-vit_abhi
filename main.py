@@ -1,7 +1,6 @@
-#This is BaseLine_VIT_modified_fractal_old_init
+### This is experimental_ViT_putting the entire image in a modified big frame with ROPE
 
 ### Necessary Imports and dependencies
-
 import os
 import shutil
 import time
@@ -136,54 +135,67 @@ val_loader = torch.utils.data.DataLoader(
 )
 
 
-def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
-    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
-    assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
-    omega = torch.arange(dim // 4) / (dim // 4 - 1)
-    omega = 1.0 / (temperature ** omega)
+def rotate_half(x):
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, sin, cos):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+def create_rope_embeddings(dim, seq_length, device, base=10000):
+    # Generate pair-wise relative positions
+    theta = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
     
-    y = y.flatten()[:, None] * omega[None, :]
-    x = x.flatten()[:, None] * omega[None, :]
-    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
-    return pe.type(dtype)
+    # Create position sequence
+    seq_idx = torch.arange(seq_length, device=device).float()
+    
+    # Compute sin and cos
+    sincos = torch.einsum('i,j->ij', seq_idx, theta)
+    sin, cos = torch.sin(sincos), torch.cos(sincos)
+    
+    # Expand dimensions for broadcasting
+    sin = torch.repeat_interleave(sin, 2, dim=-1)
+    cos = torch.repeat_interleave(cos, 2, dim=-1)
+    
+    return sin, cos
 
-def generate_combined_posemb(dim, device):
-    # Generate embeddings for each part
-    pe_256 = posemb_sincos_2d(16, 16, dim).to(device)
-    pe_16 = posemb_sincos_2d(4, 4, dim).to(device)
-    pe_1 = posemb_sincos_2d(1, 1, dim).to(device)
+class RotaryAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads, dropout=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.scaling = self.head_dim ** -0.5
 
-    # Concatenate along the sequence dimension
-    combined_pe = torch.cat([pe_256, pe_16, pe_1], dim=0)
-    return combined_pe
-
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         
-def create_fractal_attention_mask(n_h, n_w):
-    # Create mask for 16x16 grid
-    mask_16x16 = torch.ones(n_h * n_w, n_h * n_w)
-    
-    # Create mask for 4x4 summary tokens
-    mask_4x4 = torch.ones(n_h * n_w // 16, n_h * n_w // 16)
-    
-    # Create mask for global token
-    mask_global = torch.ones(1, 1)
-    
-    # Combine masks
-    mask = torch.block_diag(mask_16x16, mask_4x4, mask_global)
+        self.dropout = nn.Dropout(dropout)
 
-    # Allow 4x4 summary tokens to attend to their corresponding 4x4 regions and vice versa
-    for i in range(n_h // 4):
-        for j in range(n_w // 4):
-            index = n_h * n_w + i * 4 + j
-            for row in range(i * 4, i * 4 + 4):
-                start = row * n_w + j * 4
-                mask[start:start + 4, index] = mask[index, start:start + 4] = 1
+    def forward(self, x, sin, cos):
+        B, N, C = x.shape
+        
+        # Project q, k, v
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Apply rotary embeddings
+        q, k = apply_rotary_pos_emb(q, k, sin, cos)
+        
+        # Compute attention
+        attn = (q @ k.transpose(-2, -1)) * self.scaling
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.out_proj(x)
+        
+        return x
 
-    # Allow global token to attend to everything
-    mask[-1, :] = 1
-    mask[:, -1] = 1
-
-    return mask
 
 class MLPBlock(nn.Module):
     def __init__(self, in_dim, mlp_dim, dropout):
@@ -201,10 +213,8 @@ class MLPBlock(nn.Module):
         x = self.linear_2(x)
         x = self.dropout_2(x)
         return x
-
+    
 class EncoderBlock(nn.Module):
-    """Transformer encoder block."""
-
     def __init__(
         self,
         num_heads: int,
@@ -217,21 +227,18 @@ class EncoderBlock(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
-        # Attention block
+        # Attention block with RoPE
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=attention_dropout, batch_first=True)
+        self.self_attention = RotaryAttention(hidden_dim, num_heads, dropout=attention_dropout)
         self.dropout = nn.Dropout(dropout)
 
         # MLP block
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+    def forward(self, input: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor):
         x = self.ln_1(input)
-        
-        # Apply self-attention with fractal attention masking
-        x, _ = self.self_attention(x, x, x, attn_mask=attention_mask, need_weights=False)
+        x = self.self_attention(x, sin, cos)
         x = self.dropout(x)
         x = x + input
 
@@ -253,26 +260,30 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        layers: OrderedDict[str, nn.Module] = OrderedDict()
-        for i in range(num_layers):
-            layers[f"encoder_layer_{i}"] = EncoderBlock(
+        self.layers = nn.ModuleList([
+            EncoderBlock(
                 num_heads,
                 hidden_dim,
                 mlp_dim,
                 dropout,
                 attention_dropout,
                 norm_layer,
-            )
-        self.layers = nn.Sequential(layers)
+            ) for _ in range(num_layers)
+        ])
         self.ln = norm_layer(hidden_dim)
+        
+        # Create RoPE embeddings
+        sin, cos = create_rope_embeddings(hidden_dim // num_heads, seq_length, device='cpu')
+        self.register_buffer('sin', sin)
+        self.register_buffer('cos', cos)
 
-    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+    def forward(self, input: torch.Tensor):
         x = self.dropout(input)
         for layer in self.layers:
-            x = layer(x, attention_mask)
-        return self.ln(x)
+            x = layer(x, self.sin, self.cos)
+        return self.ln(x)   
 
+    
 class SimpleVisionTransformer(nn.Module):
     def __init__(
         self,
@@ -287,11 +298,16 @@ class SimpleVisionTransformer(nn.Module):
         num_classes: int = 100,
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        num_summary_token: int = 16, # Added parameter for number of summary token 
+        num_global_token: int = 1, # Added parameter for number of global token
+        padding_size: int = 16  # New parameter for padding size
     ):
         super().__init__()
         torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
+
         self.image_size = image_size
         self.patch_size = patch_size
+        self.padding_size = padding_size
         self.hidden_dim = hidden_dim
         self.mlp_dim = mlp_dim
         self.attention_dropout = attention_dropout
@@ -299,23 +315,16 @@ class SimpleVisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.representation_size = representation_size
         self.norm_layer = norm_layer
-        self.num_heads = num_heads
-
+        self.num_summary_token = num_summary_token
+        self.num_global_token = num_global_token
         self.conv_proj = nn.Conv2d(
             in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
         )
-
-        grid_size = image_size // patch_size
-        self.grid_size = grid_size
-        seq_length = grid_size * grid_size + grid_size * grid_size // 16 + 1  # Image patches + summary tokens + global token
-        self.seq_length = seq_length
-
-        # Initialize position embeddings
-        self.register_buffer("pos_embedding", generate_combined_posemb(hidden_dim, self.conv_proj.weight.device))
-
-        # Create fractal attention mask
-        self.register_buffer("attention_mask", create_fractal_attention_mask(grid_size, grid_size))
-
+        
+        h = w = image_size // patch_size
+        seq_length = h * w + num_summary_token + num_global_token # Adding registers and global token (16 +1 registers with the last one as global token as well)
+        
+        
         self.encoder = Encoder(
             seq_length,
             num_layers,
@@ -326,6 +335,7 @@ class SimpleVisionTransformer(nn.Module):
             attention_dropout,
             norm_layer,
         )
+        self.seq_length = seq_length
 
         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
         if representation_size is None:
@@ -353,51 +363,49 @@ class SimpleVisionTransformer(nn.Module):
         if isinstance(self.heads.head, nn.Linear):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
-
+            
     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
         n, c, h, w = x.shape
         p = self.patch_size
+
         torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
         torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        
+        # Resize the input tensor
+        x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        
+        # Add padding to input
+        x = F.pad(x, (self.padding_size, self.padding_size, self.padding_size, self.padding_size), mode='constant', value=0)
 
-        # (n, c, h, w) -> (n, hidden_dim, grid_size, grid_size)
+        # Adjust n_h and n_w for padded input
+        n_h = h // p
+        n_w = w // p
+
+        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
         x = self.conv_proj(x)
-        
-        # (n, hidden_dim, grid_size, grid_size) -> (n, grid_size * grid_size, hidden_dim)
-        x = x.flatten(2).transpose(1, 2)
-        
-        # Add summary tokens (zero-initialized)
-        summary_tokens = torch.zeros((n, self.grid_size * self.grid_size // 16, self.hidden_dim), device=x.device)
-        
-        # Add global token (zero-initialized)
-        global_token = torch.zeros((n, 1, self.hidden_dim), device=x.device)
-        
+
+        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
+        x = x.reshape(n, self.hidden_dim, n_h * n_w)
+
+        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+        x = x.permute(0, 2, 1)
+
+        # Add summary tokens (equivalent to registers)
+        summary_tokens = torch.zeros((n, self.num_summary_token, self.hidden_dim), device=x.device)
+
+        # Add global token
+        global_token = torch.zeros((n, self.num_global_token, self.hidden_dim), device=x.device)
+
         # Combine all tokens
         x = torch.cat([x, summary_tokens, global_token], dim=1)
 
         return x
-
+            
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
-        n = x.shape[0]
-
-        # Add positional encoding
-        x = x + self.pos_embedding.unsqueeze(0).expand(n, -1, -1)
-
-        # Prepare attention mask for the encoder
-        attention_mask = self.attention_mask.unsqueeze(0).expand(n, -1, -1)
-        attention_mask = attention_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-        attention_mask = attention_mask.reshape(n * self.num_heads, self.seq_length, self.seq_length)
-        attention_mask = attention_mask.masked_fill(attention_mask == 0, float('-inf'))
-
-        # Apply transformer
-        x = self.encoder(x, attention_mask=attention_mask)
-        
-        # Use the global token for classification
-        x = x[:, -1]
-
-        # Apply classification head
+        x = self.encoder(x)
+        x = x[:, -1]  # Use the global token for classification
         x = self.heads(x)
 
         return x
@@ -416,7 +424,7 @@ model = SimpleVisionTransformer(
     hidden_dim=384,
     mlp_dim=1536,
 )
-
+            
 model = nn.DataParallel(model)
 model.to('cuda')
 
@@ -452,7 +460,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'BaseLine_VIT_modified_fractal_old.pt')
+    filename = os.path.join(checkpoint_path, f'Experimental_VITRoPE.pt')
     
     # Save the checkpoint
     torch.save({
@@ -520,6 +528,7 @@ class AverageMeter(object):
             raise ValueError('invalid summary type %r' % self.summary_type)
         
         return fmtstr.format(**self.__dict__)
+    
 class ProgressMeter(object):
     def __init__(self, num_batches, meters, prefix=""):
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
@@ -567,7 +576,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="ImageNet100_Baseline_run_modified_fractal_10000_old_init")
+wandb.init(project="fractual_transformer", name="Modified putting the entire image in a big frame with ROPE")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
