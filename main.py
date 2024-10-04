@@ -1,4 +1,4 @@
-### This is Fractal Transformer with mask attention and RoPE`
+### This is experimental_ViT_putting the entire image in a big frame with RoPE`
 
 ### Necessary Imports and dependencies
 import os
@@ -144,16 +144,23 @@ def apply_rotary_pos_emb(q, k, sin, cos):
     return q_embed, k_embed
 
 def create_rope_embeddings(dim, seq_length, device, base=10000):
+    # Generate pair-wise relative positions
     theta = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+    
+    # Create position sequence
     seq_idx = torch.arange(seq_length, device=device).float()
+    
+    # Compute sin and cos
     sincos = torch.einsum('i,j->ij', seq_idx, theta)
     sin, cos = torch.sin(sincos), torch.cos(sincos)
+    
+    # Expand dimensions for broadcasting
     sin = torch.repeat_interleave(sin, 2, dim=-1)
     cos = torch.repeat_interleave(cos, 2, dim=-1)
+    
     return sin, cos
 
 class RotaryAttention(nn.Module):
-    
     def __init__(self, hidden_dim, num_heads, dropout=0.0):
         super().__init__()
         self.num_heads = num_heads
@@ -167,45 +174,25 @@ class RotaryAttention(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, sin, cos, attention_mask=None):
+    def forward(self, x, sin, cos):
         B, N, C = x.shape
         
+        # Project q, k, v
         q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         
+        # Apply rotary embeddings
         q, k = apply_rotary_pos_emb(q, k, sin, cos)
         
+        # Compute attention
         attn = (q @ k.transpose(-2, -1)) * self.scaling
-        
-        if attention_mask is not None:
-            # Expand attention_mask to match the shape of attn
-            attention_mask = attention_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-            attn = attn + attention_mask
-
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
         
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.out_proj(x)
         
-        return x
-    
-class MLPBlock(nn.Module):
-    def __init__(self, in_dim, mlp_dim, dropout):
-        super().__init__()
-        self.linear_1 = nn.Linear(in_dim, mlp_dim)
-        self.activation = nn.GELU()
-        self.dropout_1 = nn.Dropout(dropout)
-        self.linear_2 = nn.Linear(mlp_dim, in_dim)
-        self.dropout_2 = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.linear_1(x)
-        x = self.activation(x)
-        x = self.dropout_1(x)
-        x = self.linear_2(x)
-        x = self.dropout_2(x)
         return x
 
 class EncoderBlock(nn.Module):
@@ -221,16 +208,18 @@ class EncoderBlock(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
+        # Attention block with RoPE
         self.ln_1 = norm_layer(hidden_dim)
         self.self_attention = RotaryAttention(hidden_dim, num_heads, dropout=attention_dropout)
         self.dropout = nn.Dropout(dropout)
 
+        # MLP block
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor):
         x = self.ln_1(input)
-        x = self.self_attention(x, sin, cos, attention_mask)
+        x = self.self_attention(x, sin, cos)
         x = self.dropout(x)
         x = x + input
 
@@ -264,14 +253,15 @@ class Encoder(nn.Module):
         ])
         self.ln = norm_layer(hidden_dim)
         
+        # Create RoPE embeddings
         sin, cos = create_rope_embeddings(hidden_dim // num_heads, seq_length, device='cpu')
         self.register_buffer('sin', sin)
         self.register_buffer('cos', cos)
 
-    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor):
         x = self.dropout(input)
         for layer in self.layers:
-            x = layer(x, self.sin, self.cos, attention_mask)
+            x = layer(x, self.sin, self.cos)
         return self.ln(x)
 
 class SimpleVisionTransformer(nn.Module):
@@ -288,11 +278,14 @@ class SimpleVisionTransformer(nn.Module):
         num_classes: int = 100,
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        num_summary_token: int = 16,
+        num_global_token: int = 1,
+        padding_size: int = 16
     ):
         super().__init__()
-        torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
         self.image_size = image_size
         self.patch_size = patch_size
+        self.padding_size = padding_size
         self.hidden_dim = hidden_dim
         self.mlp_dim = mlp_dim
         self.attention_dropout = attention_dropout
@@ -300,17 +293,19 @@ class SimpleVisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.representation_size = representation_size
         self.norm_layer = norm_layer
+        self.num_summary_token = num_summary_token
+        self.num_global_token = num_global_token
 
         self.conv_proj = nn.Conv2d(
             in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
         )
-
-        grid_size = image_size // patch_size
-        self.grid_size = grid_size
-        seq_length = grid_size * grid_size + grid_size * grid_size // 16 + 1
+        
+        padded_image_size = image_size + 2 * padding_size
+        h = w = padded_image_size // patch_size
+        self.seq_length = h * w + num_summary_token + num_global_token
 
         self.encoder = Encoder(
-            seq_length,
+            self.seq_length,
             num_layers,
             num_heads,
             hidden_dim,
@@ -319,8 +314,6 @@ class SimpleVisionTransformer(nn.Module):
             attention_dropout,
             norm_layer,
         )
-
-        self.attention_mask = self.create_fractal_attention_mask(grid_size, grid_size)
 
         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
         if representation_size is None:
@@ -331,14 +324,13 @@ class SimpleVisionTransformer(nn.Module):
             heads_layers["head"] = nn.Linear(representation_size, num_classes)
 
         self.heads = nn.Sequential(heads_layers)
-
         self._init_weights()
 
     def _init_weights(self):
         nn.init.normal_(self.conv_proj.weight, std=math.sqrt(2.0 / self.conv_proj.out_channels))
         if self.conv_proj.bias is not None:
             nn.init.zeros_(self.conv_proj.bias)
-            
+
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
             nn.init.normal_(self.heads.pre_logits.weight, std=math.sqrt(2.0 / self.heads.pre_logits.in_features))
             nn.init.zeros_(self.heads.pre_logits.bias)
@@ -347,56 +339,30 @@ class SimpleVisionTransformer(nn.Module):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
 
-    # Modified version
-    
-    def create_fractal_attention_mask(self, n_h, n_w):
-        mask_16x16 = torch.ones(n_h * n_w, n_h * n_w)
-        mask_4x4 = torch.ones(n_h * n_w // 16, n_h * n_w // 16)
-        mask_global = torch.ones(1, 1)
-        
-        mask = torch.block_diag(mask_16x16, mask_4x4, mask_global)
-        
-        for i in range(n_h * n_w // 16):
-            start_row = i * 16
-            end_row = (i + 1) * 16
-            mask[n_h * n_w + i, start_row:end_row] = 1
-            
-        mask[-1, :] = 1
-        mask[:, -1] = 1
-        
-        # Convert to attention mask format (0 for attended positions, -inf for masked positions)
-        mask = mask.float().masked_fill(mask == 0, float('-inf'))
-        
-        return mask
-    
     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
         n, c, h, w = x.shape
         p = self.patch_size
-        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
-        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+
+        x = F.pad(x, (self.padding_size, self.padding_size, self.padding_size, self.padding_size), mode='constant', value=0)
+        n_h = (h + 2 * self.padding_size) // p
+        n_w = (w + 2 * self.padding_size) // p
 
         x = self.conv_proj(x)
-        x = x.flatten(2).transpose(1, 2)
-        
-        summary_tokens = torch.zeros((n, self.grid_size * self.grid_size // 16, self.hidden_dim), device=x.device)
-        global_token = torch.zeros((n, 1, self.hidden_dim), device=x.device)
-        
+        x = x.reshape(n, self.hidden_dim, n_h * n_w)
+        x = x.permute(0, 2, 1)
+
+        summary_tokens = torch.zeros((n, self.num_summary_token, self.hidden_dim), device=x.device)
+        global_token = torch.zeros((n, self.num_global_token, self.hidden_dim), device=x.device)
         x = torch.cat([x, summary_tokens, global_token], dim=1)
-
+        
         return x
-
+            
     def forward(self, x: torch.Tensor):
-        
         x = self._process_input(x)
-        
-        attention_mask = self.attention_mask.unsqueeze(0).expand(x.shape[0], -1, -1)
-        attention_mask = attention_mask.to(x.device)
-        
-        x = self.encoder(x, attention_mask=attention_mask)
-        
-        x = x[:, -1]
+        x = self.encoder(x)
+        x = x[:, -1]  # Use the global token for classification
         x = self.heads(x)
-        
+
         return x
     
 def weight_decay_param(n, p):
@@ -404,19 +370,19 @@ def weight_decay_param(n, p):
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# Model initialization remains the same
+# create model
 model = SimpleVisionTransformer(
     image_size=256,
-    patch_size=16,
+    patch_size=18,
     num_layers=12,
     num_heads=6,
     hidden_dim=384,
     mlp_dim=1536,
 )
-
+            
 model = nn.DataParallel(model)
 model.to('cuda')
-            
+
 wd_params = [p for n, p in model.named_parameters() if weight_decay_param(n, p) and p.requires_grad]
 non_wd_params = [p for n, p in model.named_parameters() if not weight_decay_param(n, p) and p.requires_grad]
 
@@ -565,7 +531,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="Fractal Transformer with ROPE")
+wandb.init(project="fractual_transformer", name="Putting the entire image in a big frame with ROPE")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
