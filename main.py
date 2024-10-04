@@ -1,4 +1,4 @@
-### This is experimental_ViT_putting the entire image in a modified big frame with ROPE
+### This is⁠ ResNet-BaseLine with 17 registers (Channel_wise)
 
 ### Necessary Imports and dependencies
 import os
@@ -19,6 +19,7 @@ from typing import Any, Dict, Union, Type, Callable, Optional, List
 from torchvision.models.vision_transformer import MLPBlock
 import wandb
 import json
+from torchvision import models
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -134,68 +135,25 @@ val_loader = torch.utils.data.DataLoader(
     drop_last=True
 )
 
-
-def rotate_half(x):
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-def apply_rotary_pos_emb(q, k, sin, cos):
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-def create_rope_embeddings(dim, seq_length, device, base=10000):
-    # Generate pair-wise relative positions
-    theta = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
-    
-    # Create position sequence
-    seq_idx = torch.arange(seq_length, device=device).float()
-    
-    # Compute sin and cos
-    sincos = torch.einsum('i,j->ij', seq_idx, theta)
-    sin, cos = torch.sin(sincos), torch.cos(sincos)
-    
-    # Expand dimensions for broadcasting
-    sin = torch.repeat_interleave(sin, 2, dim=-1)
-    cos = torch.repeat_interleave(cos, 2, dim=-1)
-    
-    return sin, cos
-
-class RotaryAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads, dropout=0.0):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.scaling = self.head_dim ** -0.5
-
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+class ResNetToViT(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super(ResNetToViT, self).__init__()
+        self.hidden_dim = hidden_dim
         
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, sin, cos):
-        B, N, C = x.shape
+        # Linear projection from 64x64 feature map to hidden_dim for each channel
+        self.fc = nn.Linear(64 * 64, hidden_dim)
         
-        # Project q, k, v
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+    def forward(self, x: torch.Tensor):
+        # x shape: (batch_size, channels=256, height=64, width=64)
+        batch_size, channels, height, width = x.shape
         
-        # Apply rotary embeddings
-        q, k = apply_rotary_pos_emb(q, k, sin, cos)
+        # Reshape to (batch_size, 256, 64*64)
+        x = x.view(batch_size, channels, height * width)
         
-        # Compute attention
-        attn = (q @ k.transpose(-2, -1)) * self.scaling
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.out_proj(x)
+        # Project each channel's 64x64 feature map to hidden_dim
+        x = self.fc(x)  # Shape: (batch_size, 256, hidden_dim)
         
         return x
-
 
 class MLPBlock(nn.Module):
     def __init__(self, in_dim, mlp_dim, dropout):
@@ -213,8 +171,10 @@ class MLPBlock(nn.Module):
         x = self.linear_2(x)
         x = self.dropout_2(x)
         return x
-    
+
 class EncoderBlock(nn.Module):
+    """Transformer encoder block."""
+
     def __init__(
         self,
         num_heads: int,
@@ -227,18 +187,19 @@ class EncoderBlock(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
-        # Attention block with RoPE
+        # Attention block
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = RotaryAttention(hidden_dim, num_heads, dropout=attention_dropout)
+        self.self_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=attention_dropout, batch_first=True)
         self.dropout = nn.Dropout(dropout)
 
         # MLP block
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor):
+    def forward(self, input: torch.Tensor):
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.ln_1(input)
-        x = self.self_attention(x, sin, cos)
+        x, _ = self.self_attention(x, x, x, need_weights=False)
         x = self.dropout(x)
         x = x + input
 
@@ -246,7 +207,10 @@ class EncoderBlock(nn.Module):
         y = self.mlp(y)
         return x + y
 
+
 class Encoder(nn.Module):
+    """Transformer Model Encoder for sequence to sequence translation."""
+
     def __init__(
         self,
         seq_length: int,
@@ -260,35 +224,29 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        self.layers = nn.ModuleList([
-            EncoderBlock(
+        layers: OrderedDict[str, nn.Module] = OrderedDict()
+        for i in range(num_layers):
+            layers[f"encoder_layer_{i}"] = EncoderBlock(
                 num_heads,
                 hidden_dim,
                 mlp_dim,
                 dropout,
                 attention_dropout,
                 norm_layer,
-            ) for _ in range(num_layers)
-        ])
+            )
+        self.layers = nn.Sequential(layers)
         self.ln = norm_layer(hidden_dim)
-        
-        # Create RoPE embeddings
-        sin, cos = create_rope_embeddings(hidden_dim // num_heads, seq_length, device='cpu')
-        self.register_buffer('sin', sin)
-        self.register_buffer('cos', cos)
 
     def forward(self, input: torch.Tensor):
-        x = self.dropout(input)
-        for layer in self.layers:
-            x = layer(x, self.sin, self.cos)
-        return self.ln(x)   
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        return self.ln(self.layers(self.dropout(input)))
 
-    
+
 class SimpleVisionTransformer(nn.Module):
+    """Vision Transformer customised"""
+
     def __init__(
         self,
-        image_size: int,
-        patch_size: int,
         num_layers: int,
         num_heads: int,
         hidden_dim: int,
@@ -299,15 +257,9 @@ class SimpleVisionTransformer(nn.Module):
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         num_summary_token: int = 16, # Added parameter for number of summary token 
-        num_global_token: int = 1, # Added parameter for number of global token
-        padding_size: int = 16  # New parameter for padding size
+        num_global_token: int = 1 # Added parameter for number of global token
     ):
         super().__init__()
-        torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
-
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.padding_size = padding_size
         self.hidden_dim = hidden_dim
         self.mlp_dim = mlp_dim
         self.attention_dropout = attention_dropout
@@ -317,13 +269,11 @@ class SimpleVisionTransformer(nn.Module):
         self.norm_layer = norm_layer
         self.num_summary_token = num_summary_token
         self.num_global_token = num_global_token
-        self.conv_proj = nn.Conv2d(
-            in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
-        )
         
-        h = w = image_size // patch_size
-        seq_length = h * w + num_summary_token + num_global_token # Adding registers and global token (16 +1 registers with the last one as global token as well)
+        # ResNet to ViT token mapping module
+        self.resnet_to_vit = ResNetToViT(hidden_dim)
         
+        seq_length = 256 + self.num_summary_token + self.num_global_token # Adding registers and global token (16 +1 registers with the last one as global token as well)
         
         self.encoder = Encoder(
             seq_length,
@@ -335,7 +285,6 @@ class SimpleVisionTransformer(nn.Module):
             attention_dropout,
             norm_layer,
         )
-        self.seq_length = seq_length
 
         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
         if representation_size is None:
@@ -350,10 +299,10 @@ class SimpleVisionTransformer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Initialize conv_proj
-        nn.init.normal_(self.conv_proj.weight, std=math.sqrt(2.0 / self.conv_proj.out_channels))
-        if self.conv_proj.bias is not None:
-            nn.init.zeros_(self.conv_proj.bias)
+        # Initialize ResNet to ViT projection
+        nn.init.normal_(self.resnet_to_vit.fc.weight, std=math.sqrt(2.0 / (64 * 64)))
+        if self.resnet_to_vit.fc.bias is not None:
+            nn.init.zeros_(self.resnet_to_vit.fc.bias)
 
         # Initialize heads
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
@@ -364,43 +313,36 @@ class SimpleVisionTransformer(nn.Module):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
             
+        # Initialize transformer blocks
+        for m in self.encoder.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            
     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
-        n, c, h, w = x.shape
-        p = self.patch_size
-
-        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
-        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
         
-        # Resize the input tensor
-        x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
         
-        # Add padding to input
-        x = F.pad(x, (self.padding_size, self.padding_size, self.padding_size, self.padding_size), mode='constant', value=0)
-
-        # Adjust n_h and n_w for padded input
-        n_h = h // p
-        n_w = w // p
-
-        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
-        x = self.conv_proj(x)
-
-        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
-        x = x.reshape(n, self.hidden_dim, n_h * n_w)
-
-        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
-        x = x.permute(0, 2, 1)
-
+        # Assuming `x` is the output of ResNet's layer1
+        x = self.resnet_to_vit(x)  # Shape: (batch_size, 256, hidden_dim)
+        
+        n = x.shape[0]  # batch size
+        
         # Add summary tokens (equivalent to registers)
+        
         summary_tokens = torch.zeros((n, self.num_summary_token, self.hidden_dim), device=x.device)
-
+        
         # Add global token
         global_token = torch.zeros((n, self.num_global_token, self.hidden_dim), device=x.device)
-
+        
         # Combine all tokens
         x = torch.cat([x, summary_tokens, global_token], dim=1)
-
+        
         return x
-            
+
     def forward(self, x: torch.Tensor):
         # Reshape and permute the input tensor
         x = self._process_input(x)
@@ -410,21 +352,56 @@ class SimpleVisionTransformer(nn.Module):
 
         return x
     
+def build_resnet(pretrained=True):
+    resnet = models.resnet50(pretrained=pretrained)
+    modules = list(resnet.children())[:5]
+    resnet_layer1 = nn.Sequential(*modules)
+    
+    # Freeze all parameters in the ResNet layers
+    for param in resnet_layer1.parameters():
+        param.requires_grad = False
+        
+    return resnet_layer1
+
+class FullModel(nn.Module):
+    def __init__(self, hidden_dim, num_layers, num_heads, mlp_dim, num_classes, pretrained=True):
+        super(FullModel, self).__init__()
+        self.resnet_layer1 = build_resnet(pretrained)
+        
+        # Freeze ResNet layers
+        if pretrained:
+            for param in self.resnet_layer1.parameters():
+                param.requires_grad = False
+                
+        self.vit = SimpleVisionTransformer(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            hidden_dim=hidden_dim,
+            mlp_dim=mlp_dim,
+            num_classes=num_classes,
+        )
+        
+    def forward(self, x: torch.Tensor):
+        with torch.no_grad():  # This ensures no gradients are computed for ResNet
+            x = self.resnet_layer1(x)  # Shape: (batch_size, 256, 64, 64)
+            
+        # Feed these features to the Vision Transformer
+        x = self.vit(x)
+        return x
+
 def weight_decay_param(n, p):
     return p.ndim >= 2 and n.endswith('weight')
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# create model
-model = SimpleVisionTransformer(
-    image_size=256,
-    patch_size=16,
+model = FullModel(
     num_layers=12,
     num_heads=6,
     hidden_dim=384,
     mlp_dim=1536,
+    num_classes=100  # Example for ImageNet
 )
-            
+
 model = nn.DataParallel(model)
 model.to('cuda')
 
@@ -460,7 +437,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'Experimental_VITRoPE.pt')
+    filename = os.path.join(checkpoint_path, f'ResNet-VIT_customised_init.pt')
     
     # Save the checkpoint
     torch.save({
@@ -528,7 +505,6 @@ class AverageMeter(object):
             raise ValueError('invalid summary type %r' % self.summary_type)
         
         return fmtstr.format(**self.__dict__)
-    
 class ProgressMeter(object):
     def __init__(self, num_batches, meters, prefix=""):
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
@@ -576,7 +552,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="Modified putting the entire image in a big frame with ROPE")
+wandb.init(project="fractual_transformer", name="ResNet-ViT_10000_customised_init.")
 
 def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
     
