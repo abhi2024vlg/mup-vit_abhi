@@ -1,4 +1,4 @@
-### This is Flexible_ViT_attempt_patch_size_available =(8,16,32)
+### This is Flexible_ViT_attempt_baseline_with_ROPE_patch_size_available =(8,16,32)
 
 ### Necessary Imports and dependencies
 !pip install einops
@@ -139,6 +139,11 @@ val_loader = torch.utils.data.DataLoader(
     drop_last=True
 )
 
+def to_2tuple(x: Any) -> Tuple:
+    if isinstance(x, collections.abc.Iterable) and not isinstance(x, str):
+        return tuple(x)
+    return tuple(repeat(x, 2))
+
 def rotate_half(x):
     x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
     return torch.cat((-x2, x1), dim=-1)
@@ -148,14 +153,101 @@ def apply_rotary_pos_emb(q, k, sin, cos):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-def create_rope_embeddings(dim, seq_length, device, base=10000):
+def create_rope_embeddings(dim, max_seq_length, device, base=10000):
     theta = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
-    seq_idx = torch.arange(seq_length, device=device).float()
+    seq_idx = torch.arange(max_seq_length, device=device).float()
     sincos = torch.einsum('i,j->ij', seq_idx, theta)
     sin, cos = torch.sin(sincos), torch.cos(sincos)
     sin = torch.repeat_interleave(sin, 2, dim=-1)
     cos = torch.repeat_interleave(cos, 2, dim=-1)
     return sin, cos
+
+def pi_resize_patch_embed(patch_embed: torch.Tensor, new_patch_size: Tuple[int, int], interpolation: str = "bicubic", antialias: bool = True):
+    old_patch_size = tuple(patch_embed.shape[2:])
+    if old_patch_size == new_patch_size:
+        return patch_embed
+
+    def resize(x: torch.Tensor, shape: Tuple[int, int]):
+        x_resized = F.interpolate(x[None, None, ...], shape, mode=interpolation, antialias=antialias)
+        return x_resized[0, 0, ...]
+
+    def calculate_pinv(old_shape: Tuple[int, int], new_shape: Tuple[int, int]):
+        mat = []
+        for i in range(np.prod(old_shape)):
+            basis_vec = torch.zeros(old_shape)
+            basis_vec[np.unravel_index(i, old_shape)] = 1.0
+            mat.append(resize(basis_vec, new_shape).reshape(-1))
+        resize_matrix = torch.stack(mat)
+        return torch.linalg.pinv(resize_matrix)
+
+    pinv = calculate_pinv(old_patch_size, new_patch_size).to(patch_embed.device)
+
+    def resample_patch_embed(patch_embed: torch.Tensor):
+        h, w = new_patch_size
+        resampled_kernel = pinv @ patch_embed.reshape(-1)
+        return rearrange(resampled_kernel, "(h w) -> h w", h=h, w=w)
+
+    v_resample_patch_embed = torch.vmap(torch.vmap(resample_patch_embed, 0, 0), 1, 1)
+
+    return v_resample_patch_embed(patch_embed)
+
+class FlexiPatchEmbed(nn.Module):
+    def __init__(
+        self,
+        img_size: Union[int, Tuple[int, int]] = 256,
+        patch_size: Union[int, Tuple[int, int]] = 32,
+        in_chans: int = 3,
+        embed_dim: int = 384,
+        norm_layer: Optional[nn.Module] = None,
+        flatten: bool = True,
+        bias: bool = True,
+        patch_size_seq: Sequence[int] = (8, 10, 12, 15, 16, 20, 24, 30, 40, 48),
+        patch_size_probs: Optional[Sequence[float]] = None,
+        interpolation: str = "bicubic",
+        antialias: bool = True,
+    ):
+        super().__init__()
+        self.img_size = to_2tuple(img_size)
+        self.patch_size = to_2tuple(patch_size)
+        self.interpolation = interpolation
+        self.antialias = antialias
+
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=self.patch_size, stride=self.patch_size, bias=bias)
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+        self.flatten = flatten
+
+        self.patch_size_seq = patch_size_seq
+        if not patch_size_probs:
+            n = len(self.patch_size_seq)
+            self.patch_size_probs = [1.0 / n] * n
+        else:
+            self.patch_size_probs = [p / sum(patch_size_probs) for p in patch_size_probs]
+
+    def forward(self, x: torch.Tensor, patch_size: Optional[Union[int, Tuple[int, int]]] = None):
+        if not patch_size and not self.training:
+            patch_size = self.patch_size
+        elif not patch_size:
+            patch_size = to_2tuple(np.random.choice(self.patch_size_seq, p=self.patch_size_probs))
+            
+        patch_size = to_2tuple(patch_size)  # Ensure patch_size is a tuple
+        
+        if patch_size != self.patch_size:
+            weight = self.resize_patch_embed(self.proj.weight, patch_size)
+        else:
+            weight = self.proj.weight
+
+        x = F.conv2d(x, weight, bias=self.proj.bias, stride=patch_size)
+
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+
+        x = self.norm(x)
+        return x, patch_size
+
+    def resize_patch_embed(self, patch_embed: torch.Tensor, new_patch_size: Tuple[int, int]):
+        return pi_resize_patch_embed(
+            patch_embed, new_patch_size, interpolation=self.interpolation, antialias=self.antialias
+        )
 
 class RotaryAttention(nn.Module):
     def __init__(self, hidden_dim, num_heads, dropout=0.0):
@@ -163,35 +255,28 @@ class RotaryAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
         self.scaling = self.head_dim ** -0.5
-
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, sin, cos, attention_mask=None):
+    def forward(self, x, sin, cos):
         B, N, C = x.shape
-        
         q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         
+        # Ensure sin and cos match the sequence length
+        sin = sin[:N]
+        cos = cos[:N]
+        
         q, k = apply_rotary_pos_emb(q, k, sin, cos)
-        
         attn = (q @ k.transpose(-2, -1)) * self.scaling
-        
-        if attention_mask is not None:
-            attention_mask = attention_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
-            attn = attn + attention_mask
-
         attn = attn.softmax(dim=-1)
         attn = self.dropout(attn)
-        
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.out_proj(x)
-        
         return x
 
 class MLPBlock(nn.Module):
@@ -223,35 +308,23 @@ class EncoderBlock(nn.Module):
     ):
         super().__init__()
         self.num_heads = num_heads
-
         self.ln_1 = norm_layer(hidden_dim)
         self.self_attention = RotaryAttention(hidden_dim, num_heads, dropout=attention_dropout)
         self.dropout = nn.Dropout(dropout)
-
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor):
         x = self.ln_1(input)
-        x = self.self_attention(x, sin, cos, attention_mask)
+        x = self.self_attention(x, sin, cos)
         x = self.dropout(x)
         x = x + input
-
         y = self.ln_2(x)
         y = self.mlp(y)
         return x + y
 
 class Encoder(nn.Module):
-    def __init__(
-        self,
-        num_layers: int,
-        num_heads: int,
-        hidden_dim: int,
-        mlp_dim: int,
-        dropout: float,
-        attention_dropout: float,
-        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-    ):
+    def __init__(self, num_layers, num_heads, hidden_dim, mlp_dim, dropout, attention_dropout, norm_layer):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
         self.layers = nn.ModuleList([
@@ -265,160 +338,118 @@ class Encoder(nn.Module):
             ) for _ in range(num_layers)
         ])
         self.ln = norm_layer(hidden_dim)
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
 
-    def forward(self, input: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor):
         x = self.dropout(input)
+        seq_length = x.shape[1]
+        sin, cos = create_rope_embeddings(self.hidden_dim // self.num_heads, seq_length, input.device)
         for layer in self.layers:
-            x = layer(x, sin, cos, attention_mask)
+            x = layer(x, sin, cos)
         return self.ln(x)
 
-class FlexViT(nn.Module):
+class FlexiVisionTransformer(nn.Module):
     def __init__(
         self,
-        image_size: int,
-        patch_size: int,
-        num_layers: int,
-        num_heads: int,
-        hidden_dim: int,
-        mlp_dim: int,
-        dropout: float = 0.0,
-        attention_dropout: float = 0.0,
+        img_size: int = 256,
+        patch_size: int = 16,
+        in_chans: int = 3,
         num_classes: int = 100,
-        representation_size: Optional[int] = None,
-        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        embed_dim: int = 384,
+        depth: int = 12,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.,
+        qkv_bias: bool = True,
+        drop_rate: float = 0.,
+        attn_drop_rate: float = 0.,
+        drop_path_rate: float = 0.,
+        norm_layer: nn.Module = nn.LayerNorm,
+        num_registers: int = 16,
+        patch_size_seq: Sequence[int] = (8, 10, 12, 15, 16, 20, 24, 30, 40, 48),
+        patch_size_probs: Optional[Sequence[float]] = None,
     ):
         super().__init__()
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.hidden_dim = hidden_dim
-        self.mlp_dim = mlp_dim
-        self.attention_dropout = attention_dropout
-        self.dropout = dropout
         self.num_classes = num_classes
-        self.representation_size = representation_size
-        self.norm_layer = norm_layer
-
-        self.conv_proj = nn.Conv2d(
-            in_channels=3, out_channels=hidden_dim, kernel_size=self.patch_size, stride=self.patch_size
+        self.num_features = self.embed_dim = embed_dim
+        self.num_registers = num_registers
+        self.img_size = img_size
+        self.patch_size = patch_size
+        
+        self.patch_embed = FlexiPatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
+            patch_size_seq=patch_size_seq, patch_size_probs=patch_size_probs
         )
+        num_patches = (img_size // patch_size) ** 2
 
+        self.register_tokens = nn.Parameter(torch.zeros(1, num_registers, embed_dim))
+        self.global_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        
         self.encoder = Encoder(
-            num_layers,
-            num_heads,
-            hidden_dim,
-            mlp_dim,
-            dropout,
-            attention_dropout,
-            norm_layer,
+            num_layers=depth,
+            num_heads=num_heads,
+            hidden_dim=embed_dim,
+            mlp_dim=int(embed_dim * mlp_ratio),
+            dropout=drop_rate,
+            attention_dropout=attn_drop_rate,
+            norm_layer=norm_layer,
         )
-
-        heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
-        if representation_size is None:
-            heads_layers["head"] = nn.Linear(hidden_dim, num_classes)
-        else:
-            heads_layers["pre_logits"] = nn.Linear(hidden_dim, representation_size)
-            heads_layers["act"] = nn.Tanh()
-            heads_layers["head"] = nn.Linear(representation_size, num_classes)
-
-        self.heads = nn.Sequential(heads_layers)
+        
+        self.norm = norm_layer(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         self._init_weights()
 
     def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
+        nn.init.normal_(self.patch_embed.proj.weight, std=math.sqrt(2.0 / self.patch_embed.proj.out_channels))
+        if self.patch_embed.proj.bias is not None:
+            nn.init.zeros_(self.patch_embed.proj.bias)
+        nn.init.normal_(self.register_tokens, std=.02)
+        nn.init.normal_(self.global_token, std=.02)
+        self.apply(self._init_encoder_weights)
+        if isinstance(self.head, nn.Linear):
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
+
+    def _init_encoder_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=.02)
+            if m.bias is not None:
                 nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
+    def forward_features(self, x: torch.Tensor, patch_size: Optional[Union[int, Tuple[int, int]]] = None):
+        B = x.shape[0]
+        x, patch_size = self.patch_embed(x, patch_size)
+        register_tokens = self.register_tokens.expand(B, -1, -1)
+        global_token = self.global_token.expand(B, -1, -1)
+        x = torch.cat((x, register_tokens, global_token), dim=1)
+        x = self.pos_drop(x)
+        x = self.encoder(x)
+        x = self.norm(x)
+        return x[:, -1]
 
-    def create_fractal_attention_mask(self, n, patch_size):
-        # Calculate the number of patches in each dimension
-        grid_size = int(math.sqrt(n))
-        
-        # Calculate the summary grid size (equivalent to 4x4 for patch_size=16)
-        summary_ratio = 16 // patch_size
-        summary_grid_size = grid_size // summary_ratio
-        
-        # Create the main grid mask
-        mask_main = torch.ones(n, n)
-        
-        # Create the summary grid mask
-        summary_size = summary_grid_size * summary_grid_size
-        mask_summary = torch.ones(summary_size, summary_size)
-        
-        # Create the global token mask
-        mask_global = torch.ones(1, 1)
-        
-        # Combine masks
-        mask = torch.block_diag(mask_main, mask_summary, mask_global)
-        
-        # Connect summary tokens to their corresponding patches
-        for i in range(summary_size):
-            start_row = i * (summary_ratio * summary_ratio)
-            end_row = (i + 1) * (summary_ratio * summary_ratio)
-            mask[n + i, start_row:end_row] = 1
-        
-        # Connect global token to all other tokens
-        mask[-1, :] = 1
-        mask[:, -1] = 1
-        
-        # Convert to attention mask format
-        mask = mask.float().masked_fill(mask == 0, float('-inf'))
-        return mask
-
-    def _process_input(self, x: torch.Tensor, patch_size: int) -> torch.Tensor:
-        
-        n, c, h, w = x.shape
-        p = patch_size
-        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
-        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
-        n_h, n_w = h // p, w // p
-
-        # Project patches
-        x = self.conv_proj(x)
-        x = x.reshape(n, self.hidden_dim, n_h, n_w)
-        x = x.permute(0, 2, 3, 1).reshape(n, n_h * n_w, self.hidden_dim)
-
-        # Add summary tokens (scaled based on patch size)
-        summary_ratio = 16 // patch_size
-        summary_size = (n_h // summary_ratio) * (n_w // summary_ratio)
-        summary_tokens = torch.zeros((n, summary_size, self.hidden_dim), device=x.device)
-        global_token = torch.zeros((n, 1, self.hidden_dim), device=x.device)
-        
-        x = torch.cat([x, summary_tokens, global_token], dim=1)
-
-        return x, n_h * n_w, summary_size
-
-    def forward(self, x: torch.Tensor, patch_size: int):
-        x, n, summary_size = self._process_input(x, patch_size)
-        
-        attention_mask = self.create_fractal_attention_mask(n, patch_size)
-        attention_mask = attention_mask.unsqueeze(0).expand(x.shape[0], -1, -1).to(x.device)
-        
-        sin, cos = create_rope_embeddings(self.hidden_dim // self.encoder.layers[0].num_heads, x.shape[1], x.device)
-        
-        x = self.encoder(x, sin, cos, attention_mask=attention_mask)
-        
-        x = x[:, -1]
-        x = self.heads(x)
-        
+    def forward(self, x: torch.Tensor, patch_size: Optional[Union[int, Tuple[int, int]]] = None):
+        x = self.forward_features(x, patch_size)
+        x = self.head(x)
         return x
 
-# Usage example
-model = FlexViT(
-    image_size=256,
-    patch_size=16,
-    num_layers=12,
+# Create model
+model = FlexiVisionTransformer(
+    img_size=256,
+    patch_size=32,  # base patch size
+    in_chans=3,
+    num_classes=100,
+    embed_dim=384,
+    depth=12,
     num_heads=6,
-    hidden_dim=384,
-    mlp_dim=1536,
+    mlp_ratio=4.,
+    qkv_bias=True,
+    norm_layer=nn.LayerNorm,
+    num_registers=16,
+    patch_size_seq=(8, 16, 32),  # perfect tiling patch sizes
 )
 
 # Move model to GPU if available
@@ -588,7 +619,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="FlexViT_Modified_baseline_with_17_registers")
+wandb.init(project="fractual_transformer", name="FlexViT_Modified_baseline_with_17_registers_and_ROPE")
 
 def validate(val_loader, model, criterion, step, patch_sizes=(8, 16, 32), use_wandb=False, print_freq=100):
     results = {}
@@ -745,7 +776,7 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
 
         scheduler.step()
         
-        if step % 40000 == 0 and step > 0:
+        if step % 35000 == 0 and step > 0:
             break
 
 train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
