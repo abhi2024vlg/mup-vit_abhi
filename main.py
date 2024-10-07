@@ -1,4 +1,4 @@
-### This is Flexible_ViT_attempt_baseline_with_ROPE_patch_size_available =(8,16,32)
+### This is Flexible_ViT_attempt_patch_size_available =(8,16,32)
 
 ### Necessary Imports and dependencies
 !pip install einops
@@ -144,23 +144,31 @@ def to_2tuple(x: Any) -> Tuple:
         return tuple(x)
     return tuple(repeat(x, 2))
 
-def rotate_half(x):
-    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-def apply_rotary_pos_emb(q, k, sin, cos):
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-def create_rope_embeddings(dim, max_seq_length, device, base=10000):
-    theta = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
-    seq_idx = torch.arange(max_seq_length, device=device).float()
-    sincos = torch.einsum('i,j->ij', seq_idx, theta)
-    sin, cos = torch.sin(sincos), torch.cos(sincos)
-    sin = torch.repeat_interleave(sin, 2, dim=-1)
-    cos = torch.repeat_interleave(cos, 2, dim=-1)
-    return sin, cos
+def resize_abs_pos_embed(
+    pos_embed: torch.Tensor,
+    new_size: Tuple[int, int],
+    old_size: Optional[Union[int, Tuple[int, int]]] = None,
+    num_prefix_tokens: int = 1,
+    interpolation: str = "bicubic",
+    antialias: bool = True,
+) -> torch.Tensor:
+    new_size = to_2tuple(new_size)
+    new_ntok = new_size[0] * new_size[1]
+    if not old_size:
+        old_size = int(math.sqrt(pos_embed.shape[1] - num_prefix_tokens))
+    old_size = to_2tuple(old_size)
+    if new_size == old_size:
+        return pos_embed
+    if num_prefix_tokens:
+        posemb_prefix, pos_embed = pos_embed[:, :num_prefix_tokens], pos_embed[:, num_prefix_tokens:]
+    else:
+        posemb_prefix, pos_embed = None, pos_embed
+    pos_embed = pos_embed.reshape(1, old_size[0], old_size[1], -1).permute(0, 3, 1, 2)
+    pos_embed = F.interpolate(pos_embed, size=new_size, mode=interpolation, antialias=antialias)
+    pos_embed = pos_embed.permute(0, 2, 3, 1).reshape(1, new_ntok, -1)
+    if posemb_prefix is not None:
+        pos_embed = torch.cat([posemb_prefix, pos_embed], dim=1)
+    return pos_embed
 
 def pi_resize_patch_embed(patch_embed: torch.Tensor, new_patch_size: Tuple[int, int], interpolation: str = "bicubic", antialias: bool = True):
     old_patch_size = tuple(patch_embed.shape[2:])
@@ -248,37 +256,7 @@ class FlexiPatchEmbed(nn.Module):
         return pi_resize_patch_embed(
             patch_embed, new_patch_size, interpolation=self.interpolation, antialias=self.antialias
         )
-
-class RotaryAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads, dropout=0.0):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.scaling = self.head_dim ** -0.5
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, sin, cos):
-        B, N, C = x.shape
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Ensure sin and cos match the sequence length
-        sin = sin[:N]
-        cos = cos[:N]
-        
-        q, k = apply_rotary_pos_emb(q, k, sin, cos)
-        attn = (q @ k.transpose(-2, -1)) * self.scaling
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.out_proj(x)
-        return x
-
+    
 class MLPBlock(nn.Module):
     def __init__(self, in_dim, mlp_dim, dropout):
         super().__init__()
@@ -297,6 +275,8 @@ class MLPBlock(nn.Module):
         return x
 
 class EncoderBlock(nn.Module):
+    """Transformer encoder block."""
+
     def __init__(
         self,
         num_heads: int,
@@ -308,45 +288,59 @@ class EncoderBlock(nn.Module):
     ):
         super().__init__()
         self.num_heads = num_heads
+
+        # Attention block
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = RotaryAttention(hidden_dim, num_heads, dropout=attention_dropout)
+        self.self_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=attention_dropout, batch_first=True)
         self.dropout = nn.Dropout(dropout)
+
+        # MLP block
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor):
+    def forward(self, input: torch.Tensor):
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.ln_1(input)
-        x = self.self_attention(x, sin, cos)
+        x, _ = self.self_attention(x, x, x, need_weights=False)
         x = self.dropout(x)
         x = x + input
+
         y = self.ln_2(x)
         y = self.mlp(y)
         return x + y
 
 class Encoder(nn.Module):
-    def __init__(self, num_layers, num_heads, hidden_dim, mlp_dim, dropout, attention_dropout, norm_layer):
+    def __init__(
+        self,
+        seq_length: int,
+        num_layers: int,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        dropout: float,
+        attention_dropout: float,
+        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+    ):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-        self.layers = nn.ModuleList([
-            EncoderBlock(
+        layers: OrderedDict[str, nn.Module] = OrderedDict()
+        for i in range(num_layers):
+            layers[f"encoder_layer_{i}"] = EncoderBlock(
                 num_heads,
                 hidden_dim,
                 mlp_dim,
                 dropout,
                 attention_dropout,
                 norm_layer,
-            ) for _ in range(num_layers)
-        ])
+            )
+        self.layers = nn.Sequential(layers)
         self.ln = norm_layer(hidden_dim)
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
 
     def forward(self, input: torch.Tensor):
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.dropout(input)
-        seq_length = x.shape[1]
-        sin, cos = create_rope_embeddings(self.hidden_dim // self.num_heads, seq_length, input.device)
         for layer in self.layers:
-            x = layer(x, sin, cos)
+            x = layer(x)
         return self.ln(x)
 
 class FlexiVisionTransformer(nn.Module):
@@ -384,9 +378,11 @@ class FlexiVisionTransformer(nn.Module):
 
         self.register_tokens = nn.Parameter(torch.zeros(1, num_registers, embed_dim))
         self.global_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + num_registers + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
-        
+
         self.encoder = Encoder(
+            seq_length=num_patches + num_registers + 1,
             num_layers=depth,
             num_heads=num_heads,
             hidden_dim=embed_dim,
@@ -402,12 +398,20 @@ class FlexiVisionTransformer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        # Initialize patch_embed
         nn.init.normal_(self.patch_embed.proj.weight, std=math.sqrt(2.0 / self.patch_embed.proj.out_channels))
         if self.patch_embed.proj.bias is not None:
             nn.init.zeros_(self.patch_embed.proj.bias)
+
+        # Initialize pos_embed, register_tokens, and global_token
+        nn.init.normal_(self.pos_embed, std=.02)
         nn.init.normal_(self.register_tokens, std=.02)
         nn.init.normal_(self.global_token, std=.02)
+
+        # Initialize encoder
         self.apply(self._init_encoder_weights)
+
+        # Initialize head
         if isinstance(self.head, nn.Linear):
             nn.init.zeros_(self.head.weight)
             nn.init.zeros_(self.head.bias)
@@ -420,13 +424,26 @@ class FlexiVisionTransformer(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
+
     def forward_features(self, x: torch.Tensor, patch_size: Optional[Union[int, Tuple[int, int]]] = None):
         B = x.shape[0]
         x, patch_size = self.patch_embed(x, patch_size)
+
         register_tokens = self.register_tokens.expand(B, -1, -1)
         global_token = self.global_token.expand(B, -1, -1)
         x = torch.cat((x, register_tokens, global_token), dim=1)
-        x = self.pos_drop(x)
+        
+        new_size = (self.img_size // patch_size[0], self.img_size // patch_size[1])
+        
+        # Resize positional embedding to match the new number of patches
+        pos_embed = resize_abs_pos_embed(self.pos_embed, new_size, num_prefix_tokens=self.num_registers + 1)
+        
+        # Ensure pos_embed has the correct size
+        if pos_embed.size(1) != x.size(1):
+            raise ValueError(f"Positional embedding size {pos_embed.size(1)} does not match input size {x.size(1)}")
+
+        x = self.pos_drop(x + pos_embed)
+
         x = self.encoder(x)
         x = self.norm(x)
         return x[:, -1]
@@ -619,7 +636,7 @@ log_steps = 2500
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="FlexViT_Modified_baseline_with_17_registers_and_ROPE")
+wandb.init(project="fractual_transformer", name="FlexViT_Modified_baseline_with_17_registers")
 
 def validate(val_loader, model, criterion, step, patch_sizes=(8, 16, 32), use_wandb=False, print_freq=100):
     results = {}
@@ -776,7 +793,7 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
 
         scheduler.step()
         
-        if step % 35000 == 0 and step > 0:
+        if step % 40000 == 0 and step > 0:
             break
 
 train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
