@@ -1,6 +1,7 @@
-### This is experimental_ViT_putting the entire image in a big frame with RoPE`
+### This is Flexible_ViT_attempt_Modified_BIG_Frame_with_ROPE_patch_size_available =(8,16,32)
 
 ### Necessary Imports and dependencies
+!pip install einops
 import os
 import shutil
 import time
@@ -8,6 +9,7 @@ import math
 from enum import Enum
 from functools import partial
 from collections import OrderedDict
+from einops import rearrange
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,21 +17,24 @@ import torch.optim as optim
 import torch.utils.data
 from torchvision.transforms import v2
 import torchvision.transforms as transforms
-from typing import Any, Dict, Union, Type, Callable, Optional, List
+from typing import Any, Dict, Union, Type, Callable, Optional, List, Tuple, Sequence
 from torchvision.models.vision_transformer import MLPBlock
 import wandb
 import json
 from PIL import Image
 from torch.utils.data import Dataset
+import collections
+from itertools import repeat
+import numpy as np
 
 #No. of Epochs
 num_epochs=30
 
 #Warmp_Steps
-warmup_try=10000
+warmup_try=80000
 
 # Parameters specific to ImageNet100
-batch_size = 256
+batch_size = 32
 
 # Dataset loading code
 # ImageNet image size (256,256)
@@ -195,6 +200,24 @@ class RotaryAttention(nn.Module):
         
         return x
 
+
+class MLPBlock(nn.Module):
+    def __init__(self, in_dim, mlp_dim, dropout):
+        super().__init__()
+        self.linear_1 = nn.Linear(in_dim, mlp_dim)
+        self.activation = nn.GELU()
+        self.dropout_1 = nn.Dropout(dropout)
+        self.linear_2 = nn.Linear(mlp_dim, in_dim)
+        self.dropout_2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.linear_1(x)
+        x = self.activation(x)
+        x = self.dropout_1(x)
+        x = self.linear_2(x)
+        x = self.dropout_2(x)
+        return x
+    
 class EncoderBlock(nn.Module):
     def __init__(
         self,
@@ -262,8 +285,9 @@ class Encoder(nn.Module):
         x = self.dropout(input)
         for layer in self.layers:
             x = layer(x, self.sin, self.cos)
-        return self.ln(x)
+        return self.ln(x)   
 
+    
 class SimpleVisionTransformer(nn.Module):
     def __init__(
         self,
@@ -278,14 +302,14 @@ class SimpleVisionTransformer(nn.Module):
         num_classes: int = 100,
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-        num_summary_token: int = 16,
-        num_global_token: int = 1,
-        padding_size: int = 16
+        num_summary_token: int = 16, # Added parameter for number of summary token 
+        num_global_token: int = 1, # Added parameter for number of global token
     ):
         super().__init__()
+        torch._assert(image_size % patch_size == 0, "Input shape indivisible by patch size!")
+
         self.image_size = image_size
         self.patch_size = patch_size
-        self.padding_size = padding_size
         self.hidden_dim = hidden_dim
         self.mlp_dim = mlp_dim
         self.attention_dropout = attention_dropout
@@ -295,17 +319,15 @@ class SimpleVisionTransformer(nn.Module):
         self.norm_layer = norm_layer
         self.num_summary_token = num_summary_token
         self.num_global_token = num_global_token
-
         self.conv_proj = nn.Conv2d(
             in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
         )
         
-        padded_image_size = image_size + 2 * padding_size
-        h = w = padded_image_size // patch_size
-        self.seq_length = h * w + num_summary_token + num_global_token
-
+        h = w = image_size // patch_size
+        seq_length = h * w + num_summary_token + num_global_token # Adding registers and global token (16 +1 registers with the last one as global token as well)
+        
         self.encoder = Encoder(
-            self.seq_length,
+            seq_length,
             num_layers,
             num_heads,
             hidden_dim,
@@ -314,6 +336,7 @@ class SimpleVisionTransformer(nn.Module):
             attention_dropout,
             norm_layer,
         )
+        self.seq_length = seq_length
 
         heads_layers: OrderedDict[str, nn.Module] = OrderedDict()
         if representation_size is None:
@@ -324,13 +347,16 @@ class SimpleVisionTransformer(nn.Module):
             heads_layers["head"] = nn.Linear(representation_size, num_classes)
 
         self.heads = nn.Sequential(heads_layers)
+
         self._init_weights()
 
     def _init_weights(self):
+        # Initialize conv_proj
         nn.init.normal_(self.conv_proj.weight, std=math.sqrt(2.0 / self.conv_proj.out_channels))
         if self.conv_proj.bias is not None:
             nn.init.zeros_(self.conv_proj.bias)
 
+        # Initialize heads
         if hasattr(self.heads, "pre_logits") and isinstance(self.heads.pre_logits, nn.Linear):
             nn.init.normal_(self.heads.pre_logits.weight, std=math.sqrt(2.0 / self.heads.pre_logits.in_features))
             nn.init.zeros_(self.heads.pre_logits.bias)
@@ -338,26 +364,49 @@ class SimpleVisionTransformer(nn.Module):
         if isinstance(self.heads.head, nn.Linear):
             nn.init.zeros_(self.heads.head.weight)
             nn.init.zeros_(self.heads.head.bias)
-
+            
     def _process_input(self, x: torch.Tensor) -> torch.Tensor:
         n, c, h, w = x.shape
         p = self.patch_size
 
-        x = F.pad(x, (self.padding_size, self.padding_size, self.padding_size, self.padding_size), mode='constant', value=0)
-        n_h = (h + 2 * self.padding_size) // p
-        n_w = (w + 2 * self.padding_size) // p
+        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
+        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        
+        # Calculate the new size based on padding
+        new_size = 256 - 2 * p
+    
+        # Resize the input tensor
+        x = F.interpolate(x, size=(new_size, new_size), mode='bilinear', align_corners=False)
+    
+        # Add padding to input
+        x = F.pad(x, (p,p,p,p), mode='constant', value=0)
 
+        # Adjust n_h and n_w for padded input
+        n_h = h // p
+        n_w = w // p
+
+        # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
         x = self.conv_proj(x)
+
+        # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
         x = x.reshape(n, self.hidden_dim, n_h * n_w)
+
+        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
         x = x.permute(0, 2, 1)
 
+        # Add summary tokens (equivalent to registers)
         summary_tokens = torch.zeros((n, self.num_summary_token, self.hidden_dim), device=x.device)
+
+        # Add global token
         global_token = torch.zeros((n, self.num_global_token, self.hidden_dim), device=x.device)
+
+        # Combine all tokens
         x = torch.cat([x, summary_tokens, global_token], dim=1)
-        
+
         return x
             
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor,patch_size: int):
+        # Reshape and permute the input tensor
         x = self._process_input(x)
         x = self.encoder(x)
         x = x[:, -1]  # Use the global token for classification
@@ -373,7 +422,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # create model
 model = SimpleVisionTransformer(
     image_size=256,
-    patch_size=18,
+    patch_size=16,
     num_layers=12,
     num_heads=6,
     hidden_dim=384,
@@ -415,7 +464,7 @@ def save_checkpoint(state, is_best, path, filename='imagenet_baseline_patchconvc
 
 def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path):
     # Define the filename with the current step
-    filename = os.path.join(checkpoint_path, f'Experimental_VIT.pt')
+    filename = os.path.join(checkpoint_path, f'Flex_VIT.pt')
     
     # Save the checkpoint
     torch.save({
@@ -425,7 +474,6 @@ def save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoin
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict()
     }, filename)
-    
 
 class Summary(Enum):
     NONE = 0
@@ -511,37 +559,54 @@ def accuracy(output, target, topk=(1,), class_prob=False):
         maxk = max(topk)
         batch_size = target.size(0)
         
-        # with e.g. MixUp target is now given by probabilities for each class so we need to convert to class indices
+        # Convert probabilities to class indices if required (e.g., in MixUp or CutMix)
         if class_prob:
-            _, target = target.topk(1, 1, True, True)
-            target = target.squeeze(dim=1)
+            target = target.argmax(dim=1)  # Convert from probabilities to class indices
 
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
+        # Get the top-k predictions from the model output
+        _, pred = output.topk(maxk, 1, True, True)  # top-k predictions for each sample
+        pred = pred.t()  # Transpose pred to shape [k, batch_size]
+        
+        # Ensure target is reshaped to [batch_size] (if not already)
+        if target.dim() > 1:
+            target = target.argmax(dim=1)  # Convert target to indices if needed
+            
+        # Now, compare predictions with target
+        correct = pred.eq(target.view(1, -1))  # Compare without unnecessary expand
+        
+        # Compute accuracy for top-k predictions
         res = []
         for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(1.0 / batch_size))
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)  # Correct top-k predictions
+            res.append(correct_k.mul_(1.0 / batch_size))  # Normalize by batch size
+            
         return res
-    
+
 log_steps = 2500
 
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="Putting the entire image in a big frame with ROPE")
+wandb.init(project="fractual_transformer", name="FlexViT_Modified_Big_Frame_and_ROPE")
 
-def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100):
+def validate(val_loader, model, criterion, step, patch_sizes=(8, 16, 32), use_wandb=False, print_freq=100):
+    results = {}
     
-    def run_validate(loader, base_progress=0):
-        with torch.no_grad():
-            torch.cuda.empty_cache()
-            end = time.time()
-            for i, (images, target) in enumerate(loader):
-                i = base_progress + i
+    for patch_size in patch_sizes:
+        batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
+        losses = AverageMeter('Loss', ':.4e', Summary.NONE)
+        top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
+        top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
+        progress = ProgressMeter(
+            len(val_loader),
+            [batch_time, losses, top1, top5],
+            prefix=f'Test (Patch Size {patch_size}): ')
 
+        model.eval()
+
+        with torch.no_grad():
+            end = time.time()
+            for i, (images, target) in enumerate(val_loader):
                 if torch.cuda.is_available():
                     images = images.cuda(non_blocking=True)
                     target = target.cuda(non_blocking=True)
@@ -549,16 +614,16 @@ def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100
                     images = images.to('mps')
                     target = target.to('mps')
 
-                # compute output
-                output = model(images)
-                loss = criterion(output,target)
+                # compute output with specific patch size
+                output = model(images, patch_size=patch_size)
+                loss = criterion(output, target)
 
                 # measure accuracy and record loss
-                acc1, acc5 = accuracy(output,target, topk=(1, 5))
-                losses.update(loss.item(),images.size(0))
-                top1.update(acc1[0].item(),images.size(0))
-                top5.update(acc5[0].item(),images.size(0))
-                    
+                acc1, acc5 = accuracy(output, target, topk=(1, 5))
+                losses.update(loss.item(), images.size(0))
+                top1.update(acc1[0].item(), images.size(0))
+                top5.update(acc5[0].item(), images.size(0))
+                
                 # measure elapsed time
                 batch_time.update(time.time() - end)
                 end = time.time()
@@ -566,31 +631,21 @@ def validate(val_loader, model, criterion, step, use_wandb=False, print_freq=100
                 if i % print_freq == 0:
                     progress.display(i)
 
-    batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
-    losses = AverageMeter('Loss', ':.4e', Summary.NONE)
-    top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
-    top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1, top5],
-        prefix='Test: ')
-
-    # switch to evaluate mode
-    model.eval()
-
-    run_validate(val_loader)
-
-    progress.display_summary()
-    
-    if use_wandb:        
-        log_data = {
-            'val/loss': losses.avg,
-            'val/acc@1': top1.avg,
-            'val/acc@5': top5.avg,
+        progress.display_summary()
+        
+        results[patch_size] = {
+            'loss': losses.avg,
+            'acc@1': top1.avg,
+            'acc@5': top5.avg,
         }
+
+    if use_wandb:
+        log_data = {f'val/loss_p{p}': v['loss'] for p, v in results.items()}
+        log_data.update({f'val/acc@1_p{p}': v['acc@1'] for p, v in results.items()})
+        log_data.update({f'val/acc@5_p{p}': v['acc@5'] for p, v in results.items()})
         wandb.log(log_data, step=step)
 
-    return top1.avg
+    return results
 
 def train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -606,98 +661,78 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
         [batch_time, data_time, losses, top1, top5]
     )
 
-    # switch to train mode
     model.train()
     end = time.time()
     best_acc1 = 0
+    
     
     def infinite_loader():
         while True:
             yield from train_loader
 
+    patch_sizes = [8, 16, 32]  # Available patch sizes
+
     for step, (images, target) in zip(range(start_step + 1, total_steps + 1), infinite_loader()):
-        # measure data loading time
+        
+        
         data_time.update(time.time() - end)
 
-        # move data to the same device as model
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
-        step_loss = step_acc1 = step_acc5 = 0.0
+
+        # Randomly choose patch size for this step
+        patch_size = np.random.choice(patch_sizes)
+
+        output = model(images, patch_size=patch_size)
+        loss = criterion(output, target)
         
-        output = model(images)
-        loss = criterion(output,target)
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0].item(), images.size(0))
+        top5.update(acc5[0].item(), images.size(0))
         
-        
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5), class_prob=True)
-        step_loss += loss.item()
-        step_acc1 += acc1[0].item()
-        step_acc5 += acc5[0].item()
-        
-        losses.update(step_loss, images.size(0))
-        top1.update(step_acc1, images.size(0))
-        top5.update(step_acc5, images.size(0))
-        
-        # compute gradient and do SGD step
         loss.backward()
         l2_grads = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
 
-        # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
         
         if step % print_freq == 0:
-            print(step)
             progress.display(step)
             if wandb:
-                
                 with torch.no_grad():
                     l2_params = sum(p.square().sum().item() for _, p in model.named_parameters())
-                    
+                
                 samples_per_second_per_gpu = batch_size / batch_time.val
                 samples_per_second = samples_per_second_per_gpu 
                 log_data = {
-                    "train/loss": step_loss,
-                    'train/acc@1': step_acc1,
-                    'train/acc@5': step_acc5,
+                    "train/loss": loss.item(),
+                    'train/acc@1': acc1[0].item(),
+                    'train/acc@5': acc5[0].item(),
                     "data_time": data_time.val,
                     "batch_time": batch_time.val,
                     "samples_per_second": samples_per_second,
                     "samples_per_second_per_gpu": samples_per_second_per_gpu,
                     "lr": scheduler.get_last_lr()[0],
                     "l2_grads": l2_grads.item(),
-                    "l2_params": math.sqrt(l2_params)
+                    "l2_params": math.sqrt(l2_params),
+                    "patch_size": patch_size
                 }
                 wandb.log(log_data, step=step)
         
-        if ((step % print_freq == 0) and ((step % log_steps != 0) and (step != total_steps))):        
-            
+        if step % print_freq == 0 and step % log_steps != 0 and step != total_steps:
             save_checkpoint_step(step, model, best_acc1, optimizer, scheduler, checkpoint_path)
-                
-        if step % log_steps == 0:
-            
-            acc1 = validate(val_loader, original_model, criterion, step)
-            # remember best acc@1 and save checkpoint
-            is_best = acc1 > best_acc1
-            best_acc1 = max(acc1, best_acc1)
-            
-            save_checkpoint({
-                'step': step,
-                'state_dict': original_model.state_dict(),
-                'best_acc1': best_acc1,
-                'optimizer' : optimizer.state_dict(),
-                'scheduler' : scheduler.state_dict()
-            }, is_best,checkpoint_path)
-            
-        elif step == total_steps:
-            
-            acc1 = validate(val_loader, original_model, criterion, step)
 
-            # remember best acc@1 and save checkpoint
-            is_best = acc1 > best_acc1
-            best_acc1 = max(acc1, best_acc1)
+                
+        if step % log_steps == 0 or step == total_steps:
+            val_results = validate(val_loader, original_model, criterion, step, patch_sizes=patch_sizes, use_wandb=True)
+            
+            # Use the average acc@1 across all patch sizes for determining the best model
+            avg_acc1 = sum(result['acc@1'] for result in val_results.values()) / len(val_results)
+            is_best = avg_acc1 > best_acc1
+            best_acc1 = max(avg_acc1, best_acc1)
             
             save_checkpoint({
                 'step': step,
@@ -705,12 +740,13 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
-            }, is_best,checkpoint_path)
-            
+            }, is_best, checkpoint_path)
 
         scheduler.step()
         
+        if step % 35000 == 0 and step > 0:
+            break
 
-train(train_loader,val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
+train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
 
 wandb.finish()
