@@ -26,6 +26,7 @@ from torch.utils.data import Dataset
 import collections
 from itertools import repeat
 import numpy as np
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #No. of Epochs
 num_epochs=30
@@ -223,7 +224,7 @@ class FlexiPatchEmbed(nn.Module):
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=self.patch_size, stride=self.patch_size, bias=bias)
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
         self.flatten = flatten
-
+        
         self.patch_size_seq = patch_size_seq
         if not patch_size_probs:
             n = len(self.patch_size_seq)
@@ -256,7 +257,7 @@ class FlexiPatchEmbed(nn.Module):
         return pi_resize_patch_embed(
             patch_embed, new_patch_size, interpolation=self.interpolation, antialias=self.antialias
         )
-    
+
 class MLPBlock(nn.Module):
     def __init__(self, in_dim, mlp_dim, dropout):
         super().__init__()
@@ -265,7 +266,7 @@ class MLPBlock(nn.Module):
         self.dropout_1 = nn.Dropout(dropout)
         self.linear_2 = nn.Linear(mlp_dim, in_dim)
         self.dropout_2 = nn.Dropout(dropout)
-
+    
     def forward(self, x):
         x = self.linear_1(x)
         x = self.activation(x)
@@ -273,10 +274,8 @@ class MLPBlock(nn.Module):
         x = self.linear_2(x)
         x = self.dropout_2(x)
         return x
-
+    
 class EncoderBlock(nn.Module):
-    """Transformer encoder block."""
-
     def __init__(
         self,
         num_heads: int,
@@ -298,17 +297,19 @@ class EncoderBlock(nn.Module):
         self.ln_2 = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.ln_1(input)
-        x, _ = self.self_attention(x, x, x, need_weights=False)
+        
+        # Apply self-attention with the reshaped attention mask
+        x, _ = self.self_attention(x, x, x, attn_mask=attention_mask, need_weights=False)
         x = self.dropout(x)
         x = x + input
 
         y = self.ln_2(x)
         y = self.mlp(y)
         return x + y
-
+    
 class Encoder(nn.Module):
     def __init__(
         self,
@@ -336,14 +337,33 @@ class Encoder(nn.Module):
         self.layers = nn.Sequential(layers)
         self.ln = norm_layer(hidden_dim)
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.dropout(input)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, attention_mask=attention_mask)
         return self.ln(x)
 
-class FlexiVisionTransformer(nn.Module):
+def create_fractal_attention_mask(patch_size, img_size):
+    if isinstance(patch_size, tuple):
+        patch_size = patch_size[0]  # Use the first element if it's a tuple
+    
+    num_patches = (img_size // patch_size) ** 2
+    mask = torch.ones(num_patches, num_patches)
+    
+    def recursive_mask(size, start_i, start_j):
+        if size == 1:
+            return
+        half = size // 2
+        mask[start_i:start_i+half, start_j+half:start_j+size] = 0
+        mask[start_i+half:start_i+size, start_j:start_j+half] = 0
+        recursive_mask(half, start_i, start_j)
+        recursive_mask(half, start_i+half, start_j+half)
+    
+    recursive_mask(img_size // patch_size, 0, 0)
+    return mask
+
+class FlexibleVisionTransformer(nn.Module):
     def __init__(
         self,
         img_size: int = 256,
@@ -369,6 +389,7 @@ class FlexiVisionTransformer(nn.Module):
         self.num_registers = num_registers
         self.img_size = img_size
         self.patch_size = patch_size
+        self.num_heads = num_heads  
         
         self.patch_embed = FlexiPatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
@@ -380,7 +401,7 @@ class FlexiVisionTransformer(nn.Module):
         self.global_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + num_registers + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
-
+        
         self.encoder = Encoder(
             seq_length=num_patches + num_registers + 1,
             num_layers=depth,
@@ -395,28 +416,15 @@ class FlexiVisionTransformer(nn.Module):
         self.norm = norm_layer(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        self._init_weights()
-
     def _init_weights(self):
-        # Initialize patch_embed
         nn.init.normal_(self.patch_embed.proj.weight, std=math.sqrt(2.0 / self.patch_embed.proj.out_channels))
         if self.patch_embed.proj.bias is not None:
             nn.init.zeros_(self.patch_embed.proj.bias)
-
-        # Initialize pos_embed, register_tokens, and global_token
-        nn.init.normal_(self.pos_embed, std=.02)
         nn.init.normal_(self.register_tokens, std=.02)
         nn.init.normal_(self.global_token, std=.02)
+        self.apply(self._init_weights_recursive)
 
-        # Initialize encoder
-        self.apply(self._init_encoder_weights)
-
-        # Initialize head
-        if isinstance(self.head, nn.Linear):
-            nn.init.zeros_(self.head.weight)
-            nn.init.zeros_(self.head.bias)
-
-    def _init_encoder_weights(self, m):
+    def _init_weights_recursive(self, m):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=.02)
             if m.bias is not None:
@@ -424,49 +432,61 @@ class FlexiVisionTransformer(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
-
+    
     def forward_features(self, x: torch.Tensor, patch_size: Optional[Union[int, Tuple[int, int]]] = None):
+        
         B = x.shape[0]
         x, patch_size = self.patch_embed(x, patch_size)
 
         register_tokens = self.register_tokens.expand(B, -1, -1)
         global_token = self.global_token.expand(B, -1, -1)
         x = torch.cat((x, register_tokens, global_token), dim=1)
+    
+        # Calculate the sequence length
+        seq_length = x.size(1)
+    
+        attention_mask = create_fractal_attention_mask(patch_size, self.img_size)
+        attention_mask = F.pad(attention_mask, (1 + self.num_registers, 0, 1 + self.num_registers, 0), value=1)
+        attention_mask = -10000.0 * (1.0 - attention_mask)
+    
+        # Move attention_mask to the same device as x
+        attention_mask = attention_mask.to(x.device)
+    
+        # Expand attention_mask for multi-head attention
+        
+        attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+        attention_mask = attention_mask.expand(B, self.num_heads, seq_length, seq_length)
+        attention_mask = attention_mask.reshape(B * self.num_heads, seq_length, seq_length)
+        
         
         new_size = (self.img_size // patch_size[0], self.img_size // patch_size[1])
         
         # Resize positional embedding to match the new number of patches
         pos_embed = resize_abs_pos_embed(self.pos_embed, new_size, num_prefix_tokens=self.num_registers + 1)
-        
+    
         # Ensure pos_embed has the correct size
         if pos_embed.size(1) != x.size(1):
             raise ValueError(f"Positional embedding size {pos_embed.size(1)} does not match input size {x.size(1)}")
 
         x = self.pos_drop(x + pos_embed)
 
-        x = self.encoder(x)
+        x = self.encoder(x, attention_mask=attention_mask)
         x = self.norm(x)
         return x[:, -1]
 
-    def forward(self, x: torch.Tensor, patch_size: Optional[Union[int, Tuple[int, int]]] = None):
+    def forward(self, x, patch_size=None):
         x = self.forward_features(x, patch_size)
         x = self.head(x)
         return x
 
-# Create model
-model = FlexiVisionTransformer(
+model = FlexibleVisionTransformer(
     img_size=256,
-    patch_size=32,  # base patch size
-    in_chans=3,
+    patch_size=32,
     num_classes=100,
     embed_dim=384,
     depth=12,
     num_heads=6,
-    mlp_ratio=4.,
-    qkv_bias=True,
-    norm_layer=nn.LayerNorm,
-    num_registers=16,
-    patch_size_seq=(8, 16, 32),  # perfect tiling patch sizes
+    mlp_ratio=4,
 )
 
 # Move model to GPU if available
@@ -600,43 +620,31 @@ class ProgressMeter(object):
         fmt = '{:' + str(num_digits) + 'd}'
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
-def accuracy(output, target, topk=(1,), class_prob=False):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
+def accuracy(output, target, topk=(1,)):
     with torch.no_grad():
-        maxk = max(topk)
         batch_size = target.size(0)
+        maxk = max(topk)
         
-        # Convert probabilities to class indices if required (e.g., in MixUp or CutMix)
-        if class_prob:
-            target = target.argmax(dim=1)  # Convert from probabilities to class indices
-
-        # Get the top-k predictions from the model output
-        _, pred = output.topk(maxk, 1, True, True)  # top-k predictions for each sample
-        pred = pred.t()  # Transpose pred to shape [k, batch_size]
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
         
-        # Ensure target is reshaped to [batch_size] (if not already)
-        if target.dim() > 1:
-            target = target.argmax(dim=1)  # Convert target to indices if needed
-            
-        # Now, compare predictions with target
-        correct = pred.eq(target.view(1, -1))  # Compare without unnecessary expand
+        if target.dim() > 1:  # mixed-up labels
+            _, target = target.max(1)
         
-        # Compute accuracy for top-k predictions
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        
         res = []
         for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)  # Correct top-k predictions
-            res.append(correct_k.mul_(1.0 / batch_size))  # Normalize by batch size
-            
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
         return res
-
-
 
 log_steps = 2500
 
 wandb.login(key="cbecbe8646ebcf42a98992be9fd5b7cddae3d199")
 
 # Initialize a new run
-wandb.init(project="fractual_transformer", name="FlexViT_Modified_baseline_with_17_registers")
+wandb.init(project="fractual_transformer", name="More correct FlexVIT with mask attention only")
 
 def validate(val_loader, model, criterion, step, patch_sizes=(8, 16, 32), use_wandb=False, print_freq=100):
     results = {}
@@ -793,7 +801,7 @@ def train(train_loader, val_loader, start_step, total_steps, original_model, mod
 
         scheduler.step()
         
-        if step % 40000 == 0 and step > 0:
+        if step % 38000 == 0 and step > 0:
             break
 
 train(train_loader, val_loader, start_step, total_steps, original_model, model, criterion, optimizer, scheduler, device)
